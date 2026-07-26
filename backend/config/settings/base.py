@@ -132,6 +132,14 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 # =============================================================================
+# Routing provider (openrouteservice.org)
+# =============================================================================
+
+OPENROUTESERVICE_API_KEY = env('OPENROUTESERVICE_API_KEY', default='')
+OPENROUTESERVICE_BASE_URL = env('OPENROUTESERVICE_BASE_URL', default='https://api.openrouteservice.org')
+ROUTING_REQUEST_TIMEOUT_SECONDS = env.float('ROUTING_REQUEST_TIMEOUT_SECONDS', default=10.0)
+
+# =============================================================================
 # Django REST Framework
 # =============================================================================
 
