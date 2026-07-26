@@ -244,8 +244,19 @@ class PlanningEngineTests(SimpleTestCase):
         self.assertIsInstance(result, PlanningResult)
         self.assertIs(result.context, context)
 
-    def test_plan_with_no_evaluators_produces_empty_timeline(self):
+    def test_plan_with_no_evaluators_still_produces_a_timeline(self):
+        # Evaluators constrain a plan; they are not what builds it. With none
+        # registered nothing can block, so the full timeline is produced.
         engine = PlanningEngine(evaluators=[])
         result = engine.plan(make_context())
 
-        self.assertEqual(result.events, ())
+        self.assertEqual(
+            [event.event_type for event in result.events],
+            [
+                EventType.PRETRIP_INSPECTION,
+                EventType.DRIVE,
+                EventType.DROPOFF,
+                EventType.POSTTRIP_INSPECTION,
+            ],
+        )
+        self.assertEqual(result.rule_results, ())

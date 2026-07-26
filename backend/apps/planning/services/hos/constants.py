@@ -77,14 +77,23 @@ CYCLE_RESTART_HOURS = Decimal('34')
 THIRTY_MINUTE_BREAK_HOURS = Decimal('0.5')
 
 # BR-21 — the inspection that opens a duty period, taken On Duty (Not
-# Driving). Scheduled by PlanningEngine after a 34-hour restart, on the
-# assumption that a restart begins a new duty period (Assumption 2,
-# docs/hos-engine-design.md). BR-22's post-trip inspection is the same
-# 15 minutes and belongs here as POSTTRIP_INSPECTION_HOURS once the
-# engine closes duty periods.
+# Driving). Emitted at trip start, and again after a 34-hour restart on
+# the assumption that a restart begins a new duty period (Assumption 2,
+# docs/hos-engine-design.md).
 PRETRIP_INSPECTION_HOURS = Decimal('0.25')
 
+# BR-22 — the inspection that closes a duty period, taken On Duty (Not
+# Driving). Emitted after the final dropoff, where it is the trip's last
+# event.
+POSTTRIP_INSPECTION_HOURS = Decimal('0.25')
+
+# BR-17 / BR-18 — time consumed loading at the pickup and unloading at the
+# dropoff, both On Duty (Not Driving). Fixed policy constants, not
+# vehicle- or load-derived (see domain-analysis.md §2.2 on why no Vehicle
+# entity exists to parameterise them).
+PICKUP_HOURS = Decimal('1.0')
+DROPOFF_HOURS = Decimal('1.0')
+
 # Deliberately not yet defined, to avoid unused constants that read as
-# dead code: BR-7's 10-hour reset duration, BR-20's 30-minute fuel stop,
-# BR-17/BR-18's 1-hour pickup and dropoff, and BR-22's post-trip
-# inspection. Each belongs here when the phase that schedules it lands.
+# dead code: BR-7's 10-hour reset duration and BR-20's 30-minute fuel
+# stop. Each belongs here when the phase that schedules it lands.

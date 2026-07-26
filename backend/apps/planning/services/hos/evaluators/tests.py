@@ -619,10 +619,19 @@ class PreflightCycleRestartTests(SimpleTestCase):
     def test_exhausted_cycle_emits_a_restart_then_a_pretrip_inspection(self):
         result = self._plan('70')
 
+        # The restart and its duty-period-opening inspection come first; the
+        # rest of the trip's timeline follows and is covered separately.
         self.assertEqual(
-            [event.event_type for event in result.events],
+            [event.event_type for event in result.events[:2]],
             [EventType.CYCLE_RESTART_34, EventType.PRETRIP_INSPECTION],
         )
+
+    def test_restart_does_not_produce_a_second_pretrip_inspection(self):
+        # The restart opens the duty period, so the always-on trip-start
+        # inspection must not also fire.
+        event_types = [event.event_type for event in self._plan('70').events]
+
+        self.assertEqual(event_types.count(EventType.PRETRIP_INSPECTION), 1)
 
     def test_restart_event_is_thirty_four_off_duty_hours_from_trip_start(self):
         restart = self._plan('70').events[0]
@@ -642,8 +651,10 @@ class PreflightCycleRestartTests(SimpleTestCase):
     def test_events_are_contiguous_and_sequenced_by_the_timeline_builder(self):
         events = self._plan('70').events
 
-        self.assertEqual([event.sequence for event in events], [1, 2])
-        self.assertEqual(events[0].end_time, events[1].start_time)
+        self.assertEqual([event.sequence for event in events], list(range(1, len(events) + 1)))
+        for previous, current in zip(events, events[1:]):
+            with self.subTest(sequence=current.sequence):
+                self.assertEqual(previous.end_time, current.start_time)
 
     def test_restart_reason_traces_back_to_the_blocking_rule(self):
         result = self._plan('70')
@@ -651,11 +662,13 @@ class PreflightCycleRestartTests(SimpleTestCase):
         self.assertIn('70-hour/8-day limit', result.events[0].reason)
         self.assertIn('34-hour cycle restart', result.events[1].reason)
 
-    def test_both_events_are_located_at_the_trip_start_location(self):
+    def test_both_restart_events_are_located_at_the_trip_start_location(self):
+        # The restart and the inspection that follows it; the driving and
+        # delivery events after them are elsewhere by definition.
         result = self._plan('70')
         origin = result.context.route_legs[0]
 
-        for event in result.events:
+        for event in result.events[:2]:
             with self.subTest(event_type=event.event_type):
                 self.assertEqual(event.location_name, result.context.current_location_text)
                 self.assertEqual(event.latitude, origin.origin_latitude)
@@ -687,10 +700,14 @@ class PreflightCycleRestartTests(SimpleTestCase):
         self.assertEqual(cycle_result.evaluator_name, 'CycleLimitEvaluator')
         self.assertEqual(cycle_result.remaining_cycle_hours, Decimal('68.75'))
 
-    def test_cycle_below_the_limit_emits_no_events_and_no_extra_results(self):
+    def test_cycle_below_the_limit_emits_no_restart_and_no_extra_results(self):
         result = self._plan('40')
 
-        self.assertEqual(result.events, ())
+        self.assertNotIn(
+            EventType.CYCLE_RESTART_34, [event.event_type for event in result.events]
+        )
+        self.assertEqual(result.events[0].event_type, EventType.PRETRIP_INSPECTION)
+        self.assertEqual(result.events[0].start_time, START)
         self.assertEqual(len(result.rule_results), len(ALL_EVALUATORS_WITH_CYCLE))
         self.assertTrue(all(rule_result.allowed for rule_result in result.rule_results))
 
@@ -698,24 +715,28 @@ class PreflightCycleRestartTests(SimpleTestCase):
         # FR-1.5 rejects >70 upstream, so this is defensive only.
         result = self._plan('72')
 
-        self.assertEqual(len(result.events), 2)
         self.assertEqual(result.events[0].event_type, EventType.CYCLE_RESTART_34)
 
     def test_engine_holds_no_cycle_threshold_of_its_own(self):
         # Without CycleLimitEvaluator registered, an exhausted cycle must
         # produce no restart — the engine recognises the RESTART_34 action,
-        # it does not know what 70 hours means.
+        # it does not know what 70 hours means. The trip still plans.
         engine = PlanningEngine(evaluators=ALL_EVALUATORS)
         result = engine.plan(make_context(60, cycle_hours_used=Decimal('70')))
 
-        self.assertEqual(result.events, ())
+        self.assertNotIn(
+            EventType.CYCLE_RESTART_34, [event.event_type for event in result.events]
+        )
+        self.assertEqual(result.events[0].event_type, EventType.PRETRIP_INSPECTION)
         self.assertEqual(len(result.rule_results), len(ALL_EVALUATORS))
 
     def test_no_restart_when_no_evaluators_are_registered(self):
         engine = PlanningEngine(evaluators=[])
         result = engine.plan(make_context(60, cycle_hours_used=Decimal('70')))
 
-        self.assertEqual(result.events, ())
+        self.assertNotIn(
+            EventType.CYCLE_RESTART_34, [event.event_type for event in result.events]
+        )
         self.assertEqual(result.rule_results, ())
 
     def test_a_block_that_is_not_a_restart_request_cannot_halt_the_plan_preflight(self):
