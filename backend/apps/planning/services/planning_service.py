@@ -46,11 +46,24 @@ class TripNotPlannableError(Exception):
     The Trip is left persisted with `status=failed` so the failure is
     diagnosable, but no TimelineEvent rows are written — BR-37/NFR-2.4
     require that a non-compliant or partial plan never be stored.
+
+    `rule_id` and `evaluator_name` are carried as separate attributes rather
+    than only interpolated into the message so an API layer can surface them
+    as structured fields (FR-4.2/BR-33/US-22 traceability) without parsing
+    prose back out of a string.
     """
 
-    def __init__(self, trip_id, reason: str) -> None:
+    def __init__(
+        self,
+        trip_id,
+        reason: str,
+        rule_id: str | None = None,
+        evaluator_name: str | None = None,
+    ) -> None:
         self.trip_id = trip_id
         self.reason = reason
+        self.rule_id = rule_id
+        self.evaluator_name = evaluator_name
         super().__init__(f'Trip {trip_id} could not be planned: {reason}')
 
 
@@ -95,10 +108,19 @@ class TripPlanningService:
         result = self._engine.plan(self._build_context(trip, route))
 
         if not result.events:
-            reason = self._describe_failure(result)
+            blocking = self._blocking_result(result)
+            reason = (
+                blocking.reason if blocking is not None
+                else 'The engine produced no timeline events.'
+            )
             logger.warning('Trip %s could not be planned: %s', trip.id, reason)
             self._mark_failed(trip)
-            raise TripNotPlannableError(trip.id, reason)
+            raise TripNotPlannableError(
+                trip.id,
+                reason,
+                rule_id=blocking.rule_id if blocking is not None else None,
+                evaluator_name=blocking.evaluator_name if blocking is not None else None,
+            )
 
         self._persist(trip, result.events)
         return self._summarise(trip, result.events)
@@ -138,20 +160,22 @@ class TripPlanningService:
         )
 
     @staticmethod
-    def _describe_failure(result) -> str:
-        """Name the rule that stopped the plan, for the failure message.
+    def _blocking_result(result):
+        """Find the RuleResult that stopped the plan, if there was one.
 
         The engine returns no events when a leg is blocked, and the blocking
-        RuleResult is the last one it recorded — every earlier result was
-        allowed, since the evaluator loop stops at the first block.
+        RuleResult is the last one it recorded — the evaluator loop stops at
+        the first block, so scanning from the end finds it immediately.
+
+        Returns None for the defensive case of an empty timeline with no
+        block recorded (e.g. no evaluators registered and a route whose only
+        leg has zero duration), which is an engine defect rather than a
+        legitimately unplannable trip.
         """
-        blocking = next(
+        return next(
             (rule_result for rule_result in reversed(result.rule_results) if not rule_result.allowed),
             None,
         )
-        if blocking is None:
-            return 'the engine produced no timeline events'
-        return f'{blocking.reason} (rule {blocking.rule_id}, {blocking.evaluator_name})'
 
     @staticmethod
     @transaction.atomic

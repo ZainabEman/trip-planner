@@ -254,8 +254,12 @@ class PlanningFailureTests(TestCase):
         with self.assertRaises(TripNotPlannableError) as ctx:
             self._unplannable_service().plan_trip(trip)
 
-        self.assertIn('BR-2', str(ctx.exception))
-        self.assertIn('DutyWindowEvaluator', str(ctx.exception))
+        # Structured, so an API layer can surface them as fields rather than
+        # parsing them back out of the message.
+        self.assertEqual(ctx.exception.rule_id, 'BR-2')
+        self.assertEqual(ctx.exception.evaluator_name, 'DutyWindowEvaluator')
+        self.assertIn('14-hour duty window', ctx.exception.reason)
+        self.assertEqual(ctx.exception.trip_id, trip.id)
 
     def test_a_previously_planned_timeline_is_cleared_on_a_failed_replan(self):
         trip = make_trip()
