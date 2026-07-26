@@ -1,34 +1,31 @@
-"""Abstract interface every future FMCSA rule evaluator must implement.
+"""Abstract interface every FMCSA rule evaluator must implement.
 
-No concrete rule logic exists yet — this phase only defines the contract
-concrete evaluators (11-hour driving limit, 14-hour window, 30-minute
-break, 70-hour cycle, 34-hour restart, fuel interval, etc.) will satisfy
-once they are implemented in a later phase.
+Phase 4C.2 implements the first two concrete rules (DrivingLimitEvaluator,
+DutyWindowEvaluator) against this contract. Rules not yet implemented
+(30-minute break, fuel interval, 70-hour cycle, 34-hour restart) will
+satisfy this same interface when they arrive in a later phase.
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any
 
-from apps.planning.services.hos.models import PlanningContext
+from apps.planning.services.hos.models import EvaluationContext, RuleResult
 
 
 class RuleEvaluator(ABC):
     """One independently-testable FMCSA rule check.
 
-    A concrete evaluator will likely need more than the static
-    PlanningContext (e.g. the current simulation state and a proposed
-    driving increment) — the richer per-step context type is intentionally
-    left undefined until the first concrete rule is implemented.
+    An evaluator never creates TimelineEvents and never mutates anything
+    itself — it only inspects an EvaluationContext and returns a RuleResult
+    describing whether the proposed driving increment is allowed.
     """
 
     @abstractmethod
-    def evaluate(self, context: PlanningContext) -> Any:
-        """Evaluate this rule against the current planning context/state.
+    def evaluate(self, context: EvaluationContext) -> RuleResult:
+        """Evaluate this rule against a proposed driving increment.
 
-        Concrete evaluators will return a RuleResult (introduced alongside
-        the first concrete rule) describing whether the proposed action is
-        allowed and, if not, what must happen instead and why.
+        Returns a RuleResult describing whether the increment is allowed
+        and, if not, why — never raises for an ordinary rule violation.
         """
         raise NotImplementedError
 
@@ -38,6 +35,9 @@ class RuleEvaluator(ABC):
 
         See docs/hos-engine-design.md §4 for the intended precedence order
         (70-hour cycle, then 14-hour window, then 8-hour break trigger,
-        then 11-hour driving limit, then fuel interval).
+        then 11-hour driving limit, then fuel interval). This phase leaves
+        gaps in the numbering (10/20/30/40/50) so the not-yet-implemented
+        rules can be inserted at their intended position later without
+        renumbering the ones that already exist.
         """
         raise NotImplementedError

@@ -27,3 +27,10 @@ class TimelineAssemblyError(HOSEngineError):
     """Raised when TimelineBuilder cannot assemble a structurally consistent
     timeline (e.g. two events overlap in time).
     """
+
+
+class InvalidEvaluationContextError(HOSEngineError):
+    """Raised when an EvaluationContext is constructed with invalid inputs
+    (e.g. a negative hours value). Structural validation only — never an
+    FMCSA rule violation, which is what RuleResult(allowed=False) is for.
+    """

@@ -19,8 +19,13 @@ from datetime import datetime
 from decimal import Decimal
 
 from apps.planning.choices import DutyStatus, EventType
-from apps.planning.services.hos.exceptions import InvalidPlanningContextError
+from apps.planning.services.hos.exceptions import (
+    InvalidEvaluationContextError,
+    InvalidPlanningContextError,
+)
 from apps.planning.services.hos.state_machine import DutyState
+
+MINUTES_PER_HOUR = Decimal('60')
 
 
 @dataclass(frozen=True)
@@ -38,6 +43,10 @@ class RouteLegInput:
     destination_longitude: float
     distance_miles: Decimal
     duration_minutes: int
+
+    @property
+    def duration_hours(self) -> Decimal:
+        return Decimal(self.duration_minutes) / MINUTES_PER_HOUR
 
 
 @dataclass(frozen=True)
@@ -90,11 +99,58 @@ class DutyTransition:
 
 
 @dataclass(frozen=True)
+class EvaluationContext:
+    """Per-decision-point snapshot a RuleEvaluator checks a proposed driving
+    increment against.
+
+    Distinct from PlanningContext (the static, trip-level snapshot): this
+    carries the engine's running clocks at one point in the simulation.
+    `cumulative_driving_hours` and `elapsed_duty_window_hours` are tracked
+    as separate fields — even though this phase's PlanningEngine only ever
+    advances them together (nothing yet consumes on-duty time that isn't
+    driving) — because BR-1 (11-hour driving limit) and BR-2 (14-hour duty
+    window) are independent clocks that will diverge once non-driving
+    activity (breaks, fuel, inspections) is introduced in a later phase.
+    """
+
+    cumulative_driving_hours: Decimal
+    elapsed_duty_window_hours: Decimal
+    proposed_driving_hours: Decimal
+
+    def __post_init__(self) -> None:
+        if self.cumulative_driving_hours < 0:
+            raise InvalidEvaluationContextError('cumulative_driving_hours cannot be negative.')
+        if self.elapsed_duty_window_hours < 0:
+            raise InvalidEvaluationContextError('elapsed_duty_window_hours cannot be negative.')
+        if self.proposed_driving_hours < 0:
+            raise InvalidEvaluationContextError('proposed_driving_hours cannot be negative.')
+
+
+@dataclass(frozen=True)
+class RuleResult:
+    """Structured outcome of one RuleEvaluator's decision.
+
+    `remaining_driving_hours`/`remaining_duty_window_hours` are populated
+    only by the evaluator each concerns (the other is left None) — when
+    `allowed` is True, the value is the budget remaining *after* consuming
+    the proposed increment; when `allowed` is False, it is the budget that
+    was already available *before* the (rejected) proposed increment.
+    """
+
+    allowed: bool
+    evaluator_name: str
+    reason: str
+    remaining_driving_hours: Decimal | None = None
+    remaining_duty_window_hours: Decimal | None = None
+
+
+@dataclass(frozen=True)
 class PlanningResult:
     """Successful output of the planning pipeline."""
 
     context: PlanningContext
     events: tuple[EngineEvent, ...]
+    rule_results: tuple[RuleResult, ...] = ()
 
 
 @dataclass(frozen=True)

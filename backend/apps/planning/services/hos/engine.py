@@ -1,47 +1,60 @@
 """PlanningEngine — the single entry point into the HOS planning pipeline.
 
-Phase 4C.1 foundation: this wires the pipeline's components together —
-StateMachine, the registered RuleEvaluators, and TimelineBuilder — but
-implements no FMCSA rule logic itself. With zero evaluators registered
-(none exist yet), `plan()` produces an empty timeline rather than a real
-trip plan; concrete rules arrive in a later phase and will populate the
-simulation loop this class coordinates.
+Phase 4C.2: executes the registered RuleEvaluators (in priority order)
+against each RouteLeg's driving demand in turn, accumulating cumulative
+driving hours and elapsed duty-window hours as it goes. As soon as any
+evaluator blocks a leg, the engine stops processing further legs — with
+only two rules implemented (11-hour driving limit, 14-hour duty window)
+and no break/reset/restart modeled yet, there is nothing that could
+legally resume driving after a block, so halting is the only correct
+behavior at this stage.
+
+Still no TimelineEvent creation: this phase collects RuleResults only.
+StateMachine/TimelineBuilder/EventFactory are unused here for now — they
+return once event creation is implemented in a later phase.
 """
 from __future__ import annotations
 
+from decimal import Decimal
+
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
-from apps.planning.services.hos.models import PlanningContext, PlanningResult
-from apps.planning.services.hos.state_machine import DutyState, StateMachine
-from apps.planning.services.hos.timeline_builder import TimelineBuilder
+from apps.planning.services.hos.models import EvaluationContext, PlanningContext, PlanningResult, RuleResult
 
 
 class PlanningEngine:
-    """Coordinates StateMachine, registered RuleEvaluators, and TimelineBuilder.
+    """Coordinates registered RuleEvaluators over a Trip's route legs.
 
     No rule logic lives here — this class only sequences calls to the
-    other components in priority order.
+    evaluators, in priority order, and stops on the first block.
     """
 
     def __init__(self, evaluators: list[RuleEvaluator] | None = None) -> None:
         self._evaluators = sorted(evaluators or [], key=lambda evaluator: evaluator.priority())
 
     def plan(self, context: PlanningContext) -> PlanningResult:
-        # A fresh StateMachine per planning run — state is never shared
-        # across calls. Not yet threaded into the loop below; reserved for
-        # the simulation loop a later phase's evaluators will drive.
-        _state_machine = StateMachine(
-            initial_state=DutyState.OFF_DUTY,
-            initialized_at=context.trip_start_time,
-        )
-        timeline_builder = TimelineBuilder()
+        cumulative_driving_hours = Decimal('0')
+        elapsed_duty_window_hours = Decimal('0')
+        rule_results: list[RuleResult] = []
 
-        # No evaluators are registered in this foundation phase, so there is
-        # nothing yet to populate timeline_builder with. The pipeline below
-        # is wired end-to-end so it is exercised by this phase's tests;
-        # concrete RuleEvaluator implementations (a later phase) will emit
-        # real events into timeline_builder here.
-        for evaluator in self._evaluators:
-            evaluator.evaluate(context)
+        for leg in context.route_legs:
+            eval_context = EvaluationContext(
+                cumulative_driving_hours=cumulative_driving_hours,
+                elapsed_duty_window_hours=elapsed_duty_window_hours,
+                proposed_driving_hours=leg.duration_hours,
+            )
 
-        events = tuple(timeline_builder.build())
-        return PlanningResult(context=context, events=events)
+            blocked = False
+            for evaluator in self._evaluators:
+                result = evaluator.evaluate(eval_context)
+                rule_results.append(result)
+                if not result.allowed:
+                    blocked = True
+                    break
+
+            if blocked:
+                break
+
+            cumulative_driving_hours += leg.duration_hours
+            elapsed_duty_window_hours += leg.duration_hours
+
+        return PlanningResult(context=context, events=(), rule_results=tuple(rule_results))
