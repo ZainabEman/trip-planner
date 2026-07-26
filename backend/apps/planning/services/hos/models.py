@@ -111,11 +111,24 @@ class EvaluationContext:
     driving) — because BR-1 (11-hour driving limit) and BR-2 (14-hour duty
     window) are independent clocks that will diverge once non-driving
     activity (breaks, fuel, inspections) is introduced in a later phase.
+
+    `cumulative_driving_hours` is also read by BreakEvaluator (BR-4's
+    8-cumulative-hour trigger) — a separate rule, but the same underlying
+    running total, since the engine does not yet model a break resetting
+    one clock without resetting the other (that distinction only matters
+    once break/reset events actually exist).
+
+    `cumulative_distance_miles`/`proposed_distance_miles` exist for
+    FuelEvaluator (BR-19's 1,000-mile interval) and default to zero so
+    evaluators that don't care about distance (DrivingLimitEvaluator,
+    DutyWindowEvaluator, BreakEvaluator) can ignore them entirely.
     """
 
     cumulative_driving_hours: Decimal
     elapsed_duty_window_hours: Decimal
     proposed_driving_hours: Decimal
+    cumulative_distance_miles: Decimal = Decimal('0')
+    proposed_distance_miles: Decimal = Decimal('0')
 
     def __post_init__(self) -> None:
         if self.cumulative_driving_hours < 0:
@@ -124,17 +137,22 @@ class EvaluationContext:
             raise InvalidEvaluationContextError('elapsed_duty_window_hours cannot be negative.')
         if self.proposed_driving_hours < 0:
             raise InvalidEvaluationContextError('proposed_driving_hours cannot be negative.')
+        if self.cumulative_distance_miles < 0:
+            raise InvalidEvaluationContextError('cumulative_distance_miles cannot be negative.')
+        if self.proposed_distance_miles < 0:
+            raise InvalidEvaluationContextError('proposed_distance_miles cannot be negative.')
 
 
 @dataclass(frozen=True)
 class RuleResult:
     """Structured outcome of one RuleEvaluator's decision.
 
-    `remaining_driving_hours`/`remaining_duty_window_hours` are populated
-    only by the evaluator each concerns (the other is left None) — when
-    `allowed` is True, the value is the budget remaining *after* consuming
-    the proposed increment; when `allowed` is False, it is the budget that
-    was already available *before* the (rejected) proposed increment.
+    `remaining_driving_hours`/`remaining_duty_window_hours`/
+    `remaining_distance_miles` are populated only by the evaluator each
+    concerns (the others are left None) — when `allowed` is True, the
+    value is the budget remaining *after* consuming the proposed
+    increment; when `allowed` is False, it is the budget that was already
+    available *before* the (rejected) proposed increment.
     """
 
     allowed: bool
@@ -142,6 +160,7 @@ class RuleResult:
     reason: str
     remaining_driving_hours: Decimal | None = None
     remaining_duty_window_hours: Decimal | None = None
+    remaining_distance_miles: Decimal | None = None
 
 
 @dataclass(frozen=True)

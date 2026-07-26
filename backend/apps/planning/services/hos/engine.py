@@ -1,13 +1,14 @@
 """PlanningEngine — the single entry point into the HOS planning pipeline.
 
-Phase 4C.2: executes the registered RuleEvaluators (in priority order)
-against each RouteLeg's driving demand in turn, accumulating cumulative
-driving hours and elapsed duty-window hours as it goes. As soon as any
-evaluator blocks a leg, the engine stops processing further legs — with
-only two rules implemented (11-hour driving limit, 14-hour duty window)
-and no break/reset/restart modeled yet, there is nothing that could
-legally resume driving after a block, so halting is the only correct
-behavior at this stage.
+Executes the registered RuleEvaluators (in priority order) against each
+RouteLeg's driving demand in turn, accumulating cumulative driving hours,
+elapsed duty-window hours, and cumulative distance as it goes. As soon as
+any evaluator blocks a leg, the engine stops processing further legs —
+with only four rules implemented (11-hour driving limit, 14-hour duty
+window, 30-minute break trigger, 1,000-mile fuel interval) and no
+reset/restart modeled yet, there is nothing that could legally resume
+driving after a block, so halting is the only correct behavior at this
+stage.
 
 Still no TimelineEvent creation: this phase collects RuleResults only.
 StateMachine/TimelineBuilder/EventFactory are unused here for now — they
@@ -34,6 +35,7 @@ class PlanningEngine:
     def plan(self, context: PlanningContext) -> PlanningResult:
         cumulative_driving_hours = Decimal('0')
         elapsed_duty_window_hours = Decimal('0')
+        cumulative_distance_miles = Decimal('0')
         rule_results: list[RuleResult] = []
 
         for leg in context.route_legs:
@@ -41,6 +43,8 @@ class PlanningEngine:
                 cumulative_driving_hours=cumulative_driving_hours,
                 elapsed_duty_window_hours=elapsed_duty_window_hours,
                 proposed_driving_hours=leg.duration_hours,
+                cumulative_distance_miles=cumulative_distance_miles,
+                proposed_distance_miles=leg.distance_miles,
             )
 
             blocked = False
@@ -56,5 +60,6 @@ class PlanningEngine:
 
             cumulative_driving_hours += leg.duration_hours
             elapsed_duty_window_hours += leg.duration_hours
+            cumulative_distance_miles += leg.distance_miles
 
         return PlanningResult(context=context, events=(), rule_results=tuple(rule_results))
