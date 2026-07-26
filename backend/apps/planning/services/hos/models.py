@@ -13,6 +13,7 @@ vocabulary (no ORM/database access), and EngineEvent is meant to map
 """
 from __future__ import annotations
 
+import enum
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,9 +24,38 @@ from apps.planning.services.hos.exceptions import (
     InvalidEvaluationContextError,
     InvalidPlanningContextError,
 )
-from apps.planning.services.hos.state_machine import DutyState
 
 MINUTES_PER_HOUR = Decimal('60')
+
+
+class RequiredAction(enum.Enum):
+    """What the engine must schedule to clear a blocking RuleResult.
+
+    A blocked RuleResult says *that* driving may not continue; this says
+    *what would make it legal again*. Without it the engine can only tell
+    one kind of block from another by string-matching `evaluator_name`,
+    which is why every block previously halted the plan outright.
+
+    This is the mechanism that keeps the remedy for a rule out of the
+    rule's own evaluator: BR-8's 70-hour limit is checked by
+    CycleLimitEvaluator, which reports RESTART_34, and the 34-hour restart
+    itself is scheduled by PlanningEngine. There is deliberately no
+    "34HourRestartEvaluator" — a restart never forbids driving, so it
+    cannot be expressed as a RuleEvaluator's allowed/blocked verdict
+    without duplicating CycleLimitEvaluator's threshold (see
+    docs/hos-engine-design.md §3, RuleResult).
+
+    Only RESTART_34 is acted on by the engine today. The remaining members
+    are the actions the four existing evaluators already imply, named here
+    so those evaluators can report them now and the engine can learn to
+    schedule them without the vocabulary changing underneath it.
+    """
+
+    NONE = 'none'
+    BREAK_30 = 'break_30'
+    RESET_10 = 'reset_10'
+    RESTART_34 = 'restart_34'
+    FUEL = 'fuel'
 
 
 @dataclass(frozen=True)
@@ -86,16 +116,14 @@ class EngineEvent:
     distance_miles: Decimal | None = None
 
 
-@dataclass(frozen=True)
-class DutyTransition:
-    """A record of the engine's internal state machine moving from one
-    DutyState to another (see state_machine.py).
-    """
-
-    from_state: DutyState
-    to_state: DutyState
-    occurred_at: datetime
-    reason: str = ''
+# DutyTransition used to live here. It now lives in state_machine.py
+# alongside the DutyState enum whose values it records and the StateMachine
+# that produces it: this module imported DutyState to type its two fields
+# while state_machine.py imported DutyTransition back to construct it,
+# forming an import cycle that only a function-local import kept from
+# failing at startup. Moving the dataclass to its sole producer makes the
+# dependency one-directional (state_machine no longer imports this module
+# at all) and removes the deferred import.
 
 
 @dataclass(frozen=True)
@@ -122,6 +150,18 @@ class EvaluationContext:
     FuelEvaluator (BR-19's 1,000-mile interval) and default to zero so
     evaluators that don't care about distance (DrivingLimitEvaluator,
     DutyWindowEvaluator, BreakEvaluator) can ignore them entirely.
+
+    `cumulative_cycle_hours`/`proposed_on_duty_hours` exist for
+    CycleLimitEvaluator (BR-8's 70-hour/8-day limit) and default to zero
+    on the same principle. They are a separate pair from the driving
+    clocks above because the cycle counts *all* on-duty time, not just
+    driving (BR-8) — so a proposed increment contributes
+    `proposed_driving_hours + proposed_on_duty_hours` to the cycle, but
+    only `proposed_driving_hours` to the 11-hour limit. Nothing populates
+    `proposed_on_duty_hours` with a non-zero value yet (the engine emits
+    no on-duty non-driving events on the driving path), but modelling it
+    now is what stops CycleLimitEvaluator from silently encoding
+    "cycle == driving time", which is wrong and hard to spot later.
     """
 
     cumulative_driving_hours: Decimal
@@ -129,6 +169,8 @@ class EvaluationContext:
     proposed_driving_hours: Decimal
     cumulative_distance_miles: Decimal = Decimal('0')
     proposed_distance_miles: Decimal = Decimal('0')
+    cumulative_cycle_hours: Decimal = Decimal('0')
+    proposed_on_duty_hours: Decimal = Decimal('0')
 
     def __post_init__(self) -> None:
         if self.cumulative_driving_hours < 0:
@@ -141,6 +183,10 @@ class EvaluationContext:
             raise InvalidEvaluationContextError('cumulative_distance_miles cannot be negative.')
         if self.proposed_distance_miles < 0:
             raise InvalidEvaluationContextError('proposed_distance_miles cannot be negative.')
+        if self.cumulative_cycle_hours < 0:
+            raise InvalidEvaluationContextError('cumulative_cycle_hours cannot be negative.')
+        if self.proposed_on_duty_hours < 0:
+            raise InvalidEvaluationContextError('proposed_on_duty_hours cannot be negative.')
 
 
 @dataclass(frozen=True)
@@ -148,11 +194,17 @@ class RuleResult:
     """Structured outcome of one RuleEvaluator's decision.
 
     `remaining_driving_hours`/`remaining_duty_window_hours`/
-    `remaining_distance_miles` are populated only by the evaluator each
-    concerns (the others are left None) — when `allowed` is True, the
-    value is the budget remaining *after* consuming the proposed
-    increment; when `allowed` is False, it is the budget that was already
-    available *before* the (rejected) proposed increment.
+    `remaining_distance_miles`/`remaining_cycle_hours` are populated only
+    by the evaluator each concerns (the others are left None) — when
+    `allowed` is True, the value is the budget remaining *after* consuming
+    the proposed increment; when `allowed` is False, it is the budget that
+    was already available *before* the (rejected) proposed increment.
+
+    `required_action` names the remedy that would make driving legal again
+    (see RequiredAction); `rule_id` names the business rule that produced
+    the verdict (e.g. 'BR-8'), giving each emitted event's `reason` a
+    traceable origin per FR-4.2/BR-33/US-22. Both default to a neutral
+    value so every existing construction of this DTO stays valid.
     """
 
     allowed: bool
@@ -161,6 +213,9 @@ class RuleResult:
     remaining_driving_hours: Decimal | None = None
     remaining_duty_window_hours: Decimal | None = None
     remaining_distance_miles: Decimal | None = None
+    remaining_cycle_hours: Decimal | None = None
+    required_action: RequiredAction = RequiredAction.NONE
+    rule_id: str | None = None
 
 
 @dataclass(frozen=True)

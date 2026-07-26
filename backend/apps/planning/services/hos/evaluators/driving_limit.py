@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from apps.planning.services.hos.constants import ELEVEN_HOUR_DRIVING_LIMIT
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
-from apps.planning.services.hos.models import EvaluationContext, RuleResult
-
-ELEVEN_HOUR_DRIVING_LIMIT = Decimal('11.0')
+from apps.planning.services.hos.models import EvaluationContext, RequiredAction, RuleResult
 
 _EVALUATOR_NAME = 'DrivingLimitEvaluator'
+_RULE_ID = 'BR-1'
 
 
 class DrivingLimitEvaluator(RuleEvaluator):
@@ -39,6 +39,9 @@ class DrivingLimitEvaluator(RuleEvaluator):
                 remaining_driving_hours=max(
                     ELEVEN_HOUR_DRIVING_LIMIT - context.cumulative_driving_hours, Decimal('0')
                 ),
+                # Only 10 consecutive off-duty hours clear the driving clock (BR-7).
+                required_action=RequiredAction.RESET_10,
+                rule_id=_RULE_ID,
             )
 
         return RuleResult(
@@ -46,4 +49,5 @@ class DrivingLimitEvaluator(RuleEvaluator):
             evaluator_name=_EVALUATOR_NAME,
             reason='Within the 11-hour driving limit (BR-1).',
             remaining_driving_hours=ELEVEN_HOUR_DRIVING_LIMIT - projected,
+            rule_id=_RULE_ID,
         )

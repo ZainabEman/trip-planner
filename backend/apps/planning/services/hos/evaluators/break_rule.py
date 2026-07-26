@@ -19,12 +19,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from apps.planning.services.hos.constants import EIGHT_HOUR_BREAK_TRIGGER
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
-from apps.planning.services.hos.models import EvaluationContext, RuleResult
-
-EIGHT_HOUR_BREAK_TRIGGER = Decimal('8.0')
+from apps.planning.services.hos.models import EvaluationContext, RequiredAction, RuleResult
 
 _EVALUATOR_NAME = 'BreakEvaluator'
+_RULE_ID = 'BR-4'
 
 
 class BreakEvaluator(RuleEvaluator):
@@ -53,6 +53,8 @@ class BreakEvaluator(RuleEvaluator):
                 remaining_driving_hours=max(
                     EIGHT_HOUR_BREAK_TRIGGER - context.cumulative_driving_hours, Decimal('0')
                 ),
+                required_action=RequiredAction.BREAK_30,
+                rule_id=_RULE_ID,
             )
 
         return RuleResult(
@@ -60,4 +62,5 @@ class BreakEvaluator(RuleEvaluator):
             evaluator_name=_EVALUATOR_NAME,
             reason='Within the 8-cumulative-hour break trigger (BR-4).',
             remaining_driving_hours=EIGHT_HOUR_BREAK_TRIGGER - projected,
+            rule_id=_RULE_ID,
         )

@@ -15,12 +15,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from apps.planning.services.hos.constants import FUEL_INTERVAL_MILES
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
-from apps.planning.services.hos.models import EvaluationContext, RuleResult
-
-FUEL_INTERVAL_MILES = Decimal('1000')
+from apps.planning.services.hos.models import EvaluationContext, RequiredAction, RuleResult
 
 _EVALUATOR_NAME = 'FuelEvaluator'
+_RULE_ID = 'BR-19'
 
 
 class FuelEvaluator(RuleEvaluator):
@@ -47,6 +47,8 @@ class FuelEvaluator(RuleEvaluator):
                 remaining_distance_miles=max(
                     FUEL_INTERVAL_MILES - context.cumulative_distance_miles, Decimal('0')
                 ),
+                required_action=RequiredAction.FUEL,
+                rule_id=_RULE_ID,
             )
 
         return RuleResult(
@@ -54,4 +56,5 @@ class FuelEvaluator(RuleEvaluator):
             evaluator_name=_EVALUATOR_NAME,
             reason='Within the 1,000-mile fuel interval (BR-19).',
             remaining_distance_miles=FUEL_INTERVAL_MILES - projected,
+            rule_id=_RULE_ID,
         )

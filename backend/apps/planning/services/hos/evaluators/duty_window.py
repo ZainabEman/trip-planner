@@ -13,12 +13,12 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+from apps.planning.services.hos.constants import FOURTEEN_HOUR_DUTY_WINDOW
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
-from apps.planning.services.hos.models import EvaluationContext, RuleResult
-
-FOURTEEN_HOUR_DUTY_WINDOW = Decimal('14.0')
+from apps.planning.services.hos.models import EvaluationContext, RequiredAction, RuleResult
 
 _EVALUATOR_NAME = 'DutyWindowEvaluator'
+_RULE_ID = 'BR-2'
 
 
 class DutyWindowEvaluator(RuleEvaluator):
@@ -44,6 +44,9 @@ class DutyWindowEvaluator(RuleEvaluator):
                 remaining_duty_window_hours=max(
                     FOURTEEN_HOUR_DUTY_WINDOW - context.elapsed_duty_window_hours, Decimal('0')
                 ),
+                # Only a 10-hour off-duty reset reopens an expired window (BR-7).
+                required_action=RequiredAction.RESET_10,
+                rule_id=_RULE_ID,
             )
 
         return RuleResult(
@@ -51,4 +54,5 @@ class DutyWindowEvaluator(RuleEvaluator):
             evaluator_name=_EVALUATOR_NAME,
             reason='Within the 14-hour duty window (BR-2).',
             remaining_duty_window_hours=FOURTEEN_HOUR_DUTY_WINDOW - projected,
+            rule_id=_RULE_ID,
         )

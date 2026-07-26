@@ -16,13 +16,10 @@ responsibility.
 from __future__ import annotations
 
 import enum
+from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
 
 from apps.planning.services.hos.exceptions import InvalidStateTransitionError
-
-if TYPE_CHECKING:
-    from apps.planning.services.hos.models import DutyTransition
 
 
 class DutyState(enum.Enum):
@@ -34,6 +31,24 @@ class DutyState(enum.Enum):
     BREAK = 'break'
     FUEL_STOP = 'fuel_stop'
     INSPECTION = 'inspection'
+
+
+@dataclass(frozen=True)
+class DutyTransition:
+    """A record of the engine's internal state machine moving from one
+    DutyState to another.
+
+    Lives here rather than in models.py (where it was originally defined)
+    because StateMachine below is its only producer and DutyState above is
+    its only field type — keeping all three together means state_machine.py
+    imports nothing from models.py, which is what removes the import cycle
+    the two modules previously had.
+    """
+
+    from_state: DutyState
+    to_state: DutyState
+    occurred_at: datetime
+    reason: str = ''
 
 
 class StateMachine:
@@ -50,23 +65,19 @@ class StateMachine:
     ) -> None:
         self._current_state = initial_state
         self._last_transition_at = initialized_at
-        self._history: list['DutyTransition'] = []
+        self._history: list[DutyTransition] = []
 
     @property
     def current_state(self) -> DutyState:
         return self._current_state
 
     @property
-    def history(self) -> tuple['DutyTransition', ...]:
+    def history(self) -> tuple[DutyTransition, ...]:
         return tuple(self._history)
 
     def transition_to(
         self, new_state: DutyState, occurred_at: datetime, reason: str = ''
-    ) -> 'DutyTransition':
-        # Local import: avoids a circular top-level dependency with models.py,
-        # which itself imports DutyState from this module.
-        from apps.planning.services.hos.models import DutyTransition
-
+    ) -> DutyTransition:
         if self._last_transition_at is not None and occurred_at < self._last_transition_at:
             raise InvalidStateTransitionError(
                 f'Transition at {occurred_at} occurs before the previous '

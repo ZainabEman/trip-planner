@@ -1,9 +1,16 @@
 """Abstract interface every FMCSA rule evaluator must implement.
 
-Phase 4C.2 implements the first two concrete rules (DrivingLimitEvaluator,
-DutyWindowEvaluator) against this contract. Rules not yet implemented
-(30-minute break, fuel interval, 70-hour cycle, 34-hour restart) will
-satisfy this same interface when they arrive in a later phase.
+Five concrete rules now satisfy this contract: the 70-hour/8-day cycle
+(CycleLimitEvaluator), the 14-hour duty window (DutyWindowEvaluator), the
+30-minute break trigger (BreakEvaluator), the 11-hour driving limit
+(DrivingLimitEvaluator), and the 1,000-mile fuel interval (FuelEvaluator).
+
+Note what is *not* on this list: the 34-hour restart. A restart never
+forbids driving — it is the remedy for a cycle-limit block — so it cannot
+be expressed as this interface's allowed/blocked verdict. Evaluators name
+the remedy they need via `RuleResult.required_action` and PlanningEngine
+schedules it; there is deliberately no `34HourRestartEvaluator`. The same
+holds for the 30-minute break, 10-hour reset and fuel stop.
 """
 from __future__ import annotations
 
@@ -33,11 +40,19 @@ class RuleEvaluator(ABC):
     def priority(self) -> int:
         """Lower numbers are evaluated first.
 
-        See docs/hos-engine-design.md §4 for the intended precedence order
-        (70-hour cycle, then 14-hour window, then 8-hour break trigger,
-        then 11-hour driving limit, then fuel interval). This phase leaves
-        gaps in the numbering (10/20/30/40/50) so the not-yet-implemented
-        rules can be inserted at their intended position later without
-        renumbering the ones that already exist.
+        See docs/hos-engine-design.md §4 for the precedence order: 70-hour
+        cycle (10), 14-hour window (20), 8-hour break trigger (30),
+        11-hour driving limit (40), fuel interval (50). The numbering is
+        spaced by ten so a future rule can be inserted at its intended
+        position without renumbering the ones that already exist.
+
+        PlanningEngine currently returns on the *first* evaluator to
+        block, so priority doubles as short-circuit order. That is safe
+        while the only remedy the engine schedules is the pre-flight
+        restart (nothing else has advanced when it runs), but it is not a
+        general answer: the first rule to block by priority is not
+        necessarily the one that binds soonest. Selecting the
+        nearest-binding constraint, which demotes priority to a
+        tie-breaker, is deferred with the rest of timeline generation.
         """
         raise NotImplementedError

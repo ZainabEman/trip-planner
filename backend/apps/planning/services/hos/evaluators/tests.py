@@ -7,22 +7,38 @@ across all four. Edge cases include zero-length legs, fractional
 durations, empty routes, and single very long legs.
 """
 import uuid
-from datetime import datetime, timezone as dt_timezone
+from datetime import datetime, timedelta, timezone as dt_timezone
 from decimal import Decimal
 
 from django.test import SimpleTestCase
 
+from apps.planning.choices import DutyStatus, EventType
 from apps.planning.services.hos.engine import PlanningEngine
 from apps.planning.services.hos.evaluators.break_rule import BreakEvaluator
+from apps.planning.services.hos.evaluators.cycle_limit import CycleLimitEvaluator
 from apps.planning.services.hos.evaluators.driving_limit import DrivingLimitEvaluator
 from apps.planning.services.hos.evaluators.duty_window import DutyWindowEvaluator
 from apps.planning.services.hos.evaluators.fuel_rule import FuelEvaluator
 from apps.planning.services.hos.exceptions import InvalidEvaluationContextError, InvalidPlanningContextError
-from apps.planning.services.hos.models import EvaluationContext, PlanningContext, RouteLegInput
+from apps.planning.services.hos.models import (
+    EvaluationContext,
+    PlanningContext,
+    RequiredAction,
+    RouteLegInput,
+)
 
 START = datetime(2026, 7, 27, 8, 0, tzinfo=dt_timezone.utc)
 
+# The original four evaluators, deliberately *without* CycleLimitEvaluator.
+# Several tests below assert an exact `len(result.rule_results)`, so adding
+# a fifth evaluator here would change those counts and turn an additive
+# change into a churn-y one. Tests that need the cycle rule use
+# ALL_EVALUATORS_WITH_CYCLE instead. Folding the two together belongs with
+# the deferred nearest-binding-constraint work, which rewrites those
+# count assertions anyway.
 ALL_EVALUATORS = [DrivingLimitEvaluator(), DutyWindowEvaluator(), BreakEvaluator(), FuelEvaluator()]
+
+ALL_EVALUATORS_WITH_CYCLE = [*ALL_EVALUATORS, CycleLimitEvaluator()]
 
 
 def make_route_leg(sequence: int, duration_minutes: int, distance_miles: Decimal = Decimal('50.00')) -> RouteLegInput:
@@ -68,6 +84,8 @@ def eval_context(
     proposed: str,
     cumulative_distance: str = '0',
     proposed_distance: str = '0',
+    cumulative_cycle: str = '0',
+    proposed_on_duty: str = '0',
 ) -> EvaluationContext:
     return EvaluationContext(
         cumulative_driving_hours=Decimal(cumulative),
@@ -75,6 +93,8 @@ def eval_context(
         proposed_driving_hours=Decimal(proposed),
         cumulative_distance_miles=Decimal(cumulative_distance),
         proposed_distance_miles=Decimal(proposed_distance),
+        cumulative_cycle_hours=Decimal(cumulative_cycle),
+        proposed_on_duty_hours=Decimal(proposed_on_duty),
     )
 
 
@@ -451,3 +471,258 @@ class EdgeCaseTests(SimpleTestCase):
         self.assertTrue(result.rule_results[2].allowed)
         self.assertFalse(result.rule_results[3].allowed)
         self.assertEqual(result.rule_results[3].evaluator_name, 'FuelEvaluator')
+
+
+class RequiredActionTests(SimpleTestCase):
+    """Each evaluator must name the remedy that would unblock it, so the
+    engine never has to infer it from `evaluator_name`.
+    """
+
+    def test_allowed_results_carry_no_required_action_but_do_carry_a_rule_id(self):
+        for evaluator, rule_id in (
+            (DrivingLimitEvaluator(), 'BR-1'),
+            (DutyWindowEvaluator(), 'BR-2'),
+            (BreakEvaluator(), 'BR-4'),
+            (FuelEvaluator(), 'BR-19'),
+            (CycleLimitEvaluator(), 'BR-8'),
+        ):
+            with self.subTest(evaluator=type(evaluator).__name__):
+                result = evaluator.evaluate(eval_context('0', '0', '1', '0', '10'))
+                self.assertTrue(result.allowed)
+                self.assertIs(result.required_action, RequiredAction.NONE)
+                self.assertEqual(result.rule_id, rule_id)
+
+    def test_driving_limit_block_requires_a_ten_hour_reset(self):
+        result = DrivingLimitEvaluator().evaluate(eval_context('0', '0', '12'))
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.RESET_10)
+        self.assertEqual(result.rule_id, 'BR-1')
+
+    def test_duty_window_block_requires_a_ten_hour_reset(self):
+        result = DutyWindowEvaluator().evaluate(eval_context('0', '13', '2'))
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.RESET_10)
+        self.assertEqual(result.rule_id, 'BR-2')
+
+    def test_break_block_requires_a_thirty_minute_break(self):
+        result = BreakEvaluator().evaluate(eval_context('8', '8', '1'))
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.BREAK_30)
+        self.assertEqual(result.rule_id, 'BR-4')
+
+    def test_fuel_block_requires_a_fuel_stop(self):
+        result = FuelEvaluator().evaluate(eval_context('0', '0', '1', '990', '20'))
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.FUEL)
+        self.assertEqual(result.rule_id, 'BR-19')
+
+
+class CycleLimitEvaluatorTests(SimpleTestCase):
+    def setUp(self):
+        self.evaluator = CycleLimitEvaluator()
+
+    def test_priority_runs_before_every_other_rule(self):
+        self.assertEqual(self.evaluator.priority(), 10)
+        for other in ALL_EVALUATORS:
+            with self.subTest(other=type(other).__name__):
+                self.assertLess(self.evaluator.priority(), other.priority())
+
+    def test_exactly_seventy_hours_is_allowed(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '10', cumulative_cycle='60'))
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('0.0'))
+
+    def test_under_the_limit_is_allowed_with_remaining_budget(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '5', cumulative_cycle='60'))
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('5.0'))
+
+    def test_over_the_limit_is_blocked_and_requires_a_restart(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '5', cumulative_cycle='68'))
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.RESTART_34)
+        self.assertEqual(result.rule_id, 'BR-8')
+        self.assertIn('70-hour/8-day cycle', result.reason)
+
+    def test_blocked_result_reports_the_budget_available_before_the_increment(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '5', cumulative_cycle='68'))
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('2'))
+
+    def test_already_exhausted_cycle_blocks_even_a_zero_length_increment(self):
+        # The clause that makes pre-flight detection possible: at exactly 70
+        # hours no driving is permitted, so a zero-hour probe must still
+        # block. Every other evaluator allows a zero-length increment.
+        result = self.evaluator.evaluate(eval_context('0', '0', '0', cumulative_cycle='70'))
+
+        self.assertFalse(result.allowed)
+        self.assertIs(result.required_action, RequiredAction.RESTART_34)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('0'))
+        self.assertIn('reached the', result.reason)
+
+    def test_cycle_beyond_the_limit_is_blocked(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '0', cumulative_cycle='75'))
+        self.assertFalse(result.allowed)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('0'))
+
+    def test_zero_length_increment_below_the_limit_is_allowed(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '0', cumulative_cycle='69.9'))
+        self.assertTrue(result.allowed)
+
+    def test_non_driving_on_duty_hours_count_toward_the_cycle(self):
+        # BR-8 counts all on-duty time. 69 + 0.5 driving = 69.5, legal; the
+        # same increment plus 0.75h of on-duty non-driving work is 70.25,
+        # which is not.
+        allowed = self.evaluator.evaluate(eval_context('0', '0', '0.5', cumulative_cycle='69'))
+        self.assertTrue(allowed.allowed)
+
+        blocked = self.evaluator.evaluate(
+            eval_context('0', '0', '0.5', cumulative_cycle='69', proposed_on_duty='0.75')
+        )
+        self.assertFalse(blocked.allowed)
+        self.assertIs(blocked.required_action, RequiredAction.RESTART_34)
+
+    def test_ignores_the_driving_and_distance_clocks_entirely(self):
+        # A driver well over the 11-hour driving limit and the fuel interval
+        # is still within the cycle, and this evaluator must say so.
+        result = self.evaluator.evaluate(eval_context('20', '20', '1', '5000', '500'))
+        self.assertTrue(result.allowed)
+
+    def test_fractional_cycle_hours_are_handled_precisely(self):
+        result = self.evaluator.evaluate(eval_context('0', '0', '0.25', cumulative_cycle='69.75'))
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.remaining_cycle_hours, Decimal('0.00'))
+
+    def test_negative_cycle_hours_rejected_by_evaluation_context(self):
+        with self.assertRaises(InvalidEvaluationContextError):
+            eval_context('0', '0', '1', cumulative_cycle='-1')
+
+    def test_negative_on_duty_hours_rejected_by_evaluation_context(self):
+        with self.assertRaises(InvalidEvaluationContextError):
+            eval_context('0', '0', '1', proposed_on_duty='-1')
+
+
+class PreflightCycleRestartTests(SimpleTestCase):
+    """PlanningEngine's only scheduled remedy in this phase: a 34-hour
+    restart inserted before any driving when the cycle arrives exhausted
+    (BR-8/BR-10, AC-11, EC-4/EC-44).
+    """
+
+    RESTART_END = START + timedelta(hours=34)
+    INSPECTION_END = RESTART_END + timedelta(minutes=15)
+
+    def _plan(self, cycle_hours_used: str, *legs_spec):
+        engine = PlanningEngine(evaluators=ALL_EVALUATORS_WITH_CYCLE)
+        context = make_context(*(legs_spec or (60,)), cycle_hours_used=Decimal(cycle_hours_used))
+        return engine.plan(context)
+
+    def test_exhausted_cycle_emits_a_restart_then_a_pretrip_inspection(self):
+        result = self._plan('70')
+
+        self.assertEqual(
+            [event.event_type for event in result.events],
+            [EventType.CYCLE_RESTART_34, EventType.PRETRIP_INSPECTION],
+        )
+
+    def test_restart_event_is_thirty_four_off_duty_hours_from_trip_start(self):
+        restart = self._plan('70').events[0]
+
+        self.assertEqual(restart.start_time, START)
+        self.assertEqual(restart.end_time, self.RESTART_END)
+        self.assertEqual(restart.duty_status, DutyStatus.OFF_DUTY)
+        self.assertIsNone(restart.distance_miles)
+
+    def test_pretrip_inspection_is_fifteen_on_duty_minutes_after_the_restart(self):
+        inspection = self._plan('70').events[1]
+
+        self.assertEqual(inspection.start_time, self.RESTART_END)
+        self.assertEqual(inspection.end_time, self.INSPECTION_END)
+        self.assertEqual(inspection.duty_status, DutyStatus.ON_DUTY_NOT_DRIVING)
+
+    def test_events_are_contiguous_and_sequenced_by_the_timeline_builder(self):
+        events = self._plan('70').events
+
+        self.assertEqual([event.sequence for event in events], [1, 2])
+        self.assertEqual(events[0].end_time, events[1].start_time)
+
+    def test_restart_reason_traces_back_to_the_blocking_rule(self):
+        result = self._plan('70')
+
+        self.assertIn('70-hour/8-day limit', result.events[0].reason)
+        self.assertIn('34-hour cycle restart', result.events[1].reason)
+
+    def test_both_events_are_located_at_the_trip_start_location(self):
+        result = self._plan('70')
+        origin = result.context.route_legs[0]
+
+        for event in result.events:
+            with self.subTest(event_type=event.event_type):
+                self.assertEqual(event.location_name, result.context.current_location_text)
+                self.assertEqual(event.latitude, origin.origin_latitude)
+                self.assertEqual(event.longitude, origin.origin_longitude)
+
+    def test_only_the_blocking_preflight_result_is_recorded(self):
+        # One pre-flight block, then five per-leg results for the single leg.
+        result = self._plan('70')
+
+        self.assertEqual(len(result.rule_results), 6)
+        self.assertFalse(result.rule_results[0].allowed)
+        self.assertEqual(result.rule_results[0].evaluator_name, 'CycleLimitEvaluator')
+        self.assertIs(result.rule_results[0].required_action, RequiredAction.RESTART_34)
+
+    def test_driving_resumes_after_the_restart_clears_the_cycle(self):
+        # Every per-leg result must be allowed: the restart zeroed the cycle,
+        # so the leg the exhausted cycle would have blocked now proceeds.
+        result = self._plan('70')
+
+        self.assertTrue(all(rule_result.allowed for rule_result in result.rule_results[1:]))
+        self.assertEqual(len(result.rule_results[1:]), len(ALL_EVALUATORS_WITH_CYCLE))
+
+    def test_post_restart_cycle_budget_reflects_only_the_new_pretrip_inspection(self):
+        # After the restart the cycle is zero, plus 0.25h for the inspection
+        # that opened the new duty period, plus the leg's 1h of driving.
+        result = self._plan('70', 60)
+        cycle_result = result.rule_results[1]
+
+        self.assertEqual(cycle_result.evaluator_name, 'CycleLimitEvaluator')
+        self.assertEqual(cycle_result.remaining_cycle_hours, Decimal('68.75'))
+
+    def test_cycle_below_the_limit_emits_no_events_and_no_extra_results(self):
+        result = self._plan('40')
+
+        self.assertEqual(result.events, ())
+        self.assertEqual(len(result.rule_results), len(ALL_EVALUATORS_WITH_CYCLE))
+        self.assertTrue(all(rule_result.allowed for rule_result in result.rule_results))
+
+    def test_cycle_beyond_the_limit_also_triggers_the_restart(self):
+        # FR-1.5 rejects >70 upstream, so this is defensive only.
+        result = self._plan('72')
+
+        self.assertEqual(len(result.events), 2)
+        self.assertEqual(result.events[0].event_type, EventType.CYCLE_RESTART_34)
+
+    def test_engine_holds_no_cycle_threshold_of_its_own(self):
+        # Without CycleLimitEvaluator registered, an exhausted cycle must
+        # produce no restart — the engine recognises the RESTART_34 action,
+        # it does not know what 70 hours means.
+        engine = PlanningEngine(evaluators=ALL_EVALUATORS)
+        result = engine.plan(make_context(60, cycle_hours_used=Decimal('70')))
+
+        self.assertEqual(result.events, ())
+        self.assertEqual(len(result.rule_results), len(ALL_EVALUATORS))
+
+    def test_no_restart_when_no_evaluators_are_registered(self):
+        engine = PlanningEngine(evaluators=[])
+        result = engine.plan(make_context(60, cycle_hours_used=Decimal('70')))
+
+        self.assertEqual(result.events, ())
+        self.assertEqual(result.rule_results, ())
+
+    def test_a_block_that_is_not_a_restart_request_cannot_halt_the_plan_preflight(self):
+        # The pre-flight probe uses a zero-hour increment, which no rule but
+        # the cycle can block. Guard against a future evaluator blocking a
+        # zero increment and silently suppressing the whole trip.
+        result = self._plan('40', 60, 60)
+
+        self.assertEqual(len(result.rule_results), 2 * len(ALL_EVALUATORS_WITH_CYCLE))
+        self.assertTrue(all(rule_result.allowed for rule_result in result.rule_results))
