@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     'corsheaders',
     # Local
     'apps.core',
+    'apps.planning',
 ]
 
 MIDDLEWARE = [
