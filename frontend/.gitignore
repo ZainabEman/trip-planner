@@ -1,0 +1,17 @@
+# Node dependencies & builds
+node_modules/
+dist/
+.npm
+*.local
+
+# Environment
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,5 +1,19 @@
 # =============================================================================
-# Python
+# Environment Files (Secrets - NEVER COMMIT)
+# =============================================================================
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.env.*.local
+*.env
+!.env.example
+!.env.*.example
+!backend/.env.example
+
+# =============================================================================
+# Python & Virtual Environments
 # =============================================================================
 __pycache__/
 *.py[cod]
@@ -11,15 +25,16 @@ dist/
 build/
 .eggs/
 *.whl
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Virtual environments
 venv/
 .venv/
 env/
+ENV/
+backend/venv/
+backend/.venv/
 
-# Django
+# =============================================================================
+# Django Specific
+# =============================================================================
 *.log
 local_settings.py
 db.sqlite3
@@ -31,19 +46,15 @@ media/
 # Node / Frontend
 # =============================================================================
 node_modules/
+frontend/node_modules/
 dist/
-*.local
+frontend/dist/
+.npm
+.eslintcache
+.stylelintcache
 
 # =============================================================================
-# Environment
-# =============================================================================
-.env
-.env.local
-.env.*.local
-!.env.example
-
-# =============================================================================
-# IDE / Editor
+# IDE / Editor Settings
 # =============================================================================
 .idea/
 .vscode/
@@ -52,15 +63,12 @@ dist/
 *~
 .DS_Store
 Thumbs.db
+pyrightconfig.json
+backend/pyrightconfig.json
 
 # =============================================================================
-# Docker
+# Docker & System Files
 # =============================================================================
 docker-compose.override.yml
-
-# =============================================================================
-# OS
-# =============================================================================
-.DS_Store
 Desktop.ini
 ehthumbs.db
