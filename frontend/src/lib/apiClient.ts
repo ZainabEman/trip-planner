@@ -128,4 +128,12 @@ export const api = {
   getRoute(tripId: string): Promise<RouteLeg[]> {
     return request<RouteLeg[]>(`/trips/${tripId}/route/`);
   },
+
+  /**
+   * Delete a trip. Cascades to its route legs and timeline events server-side.
+   * Returns 204 with no body, which `request` surfaces as null.
+   */
+  deleteTrip(tripId: string): Promise<null> {
+    return request<null>(`/trips/${tripId}/`, { method: 'DELETE' });
+  },
 };

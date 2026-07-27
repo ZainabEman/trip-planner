@@ -10,13 +10,14 @@
  * below it rather than reporting a server total the list does not show.
  */
 import { useMemo, useState } from 'react';
-import { CheckCircle2, Clock, ListChecks, Plus, TriangleAlert } from 'lucide-react';
+import { Check, CheckCircle2, Clock, ListChecks, Plus, TriangleAlert } from 'lucide-react';
 import { hrefFor } from '../hooks/useHashRoute';
 import { useTrips } from '../hooks/useTrips';
+import { ApiError, api } from '../lib/apiClient';
 import { compareRows, matchesQuery, withinRange } from '../lib/tripMetrics';
 import type { DateRange, SortKey } from '../lib/tripMetrics';
 import { computeKpis } from '../lib/tripStats';
-import type { TripStatus } from '../types/api';
+import type { Trip, TripStatus } from '../types/api';
 import { HistorySkeleton } from '../components/Skeletons';
 import { KpiCard } from '../components/KpiCard';
 import { TripCard } from '../components/TripCard';
@@ -26,6 +27,7 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { FilterTabs } from '../components/ui/FilterTabs';
 import { PageHeader } from '../components/ui/PageHeader';
 import { SearchInput } from '../components/ui/SearchInput';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 
 type StatusFilter = 'all' | TripStatus;
 
@@ -80,10 +82,36 @@ export function HistoryPage() {
   const [sort, setSort] = useState<SortKey>('newest');
   const [query, setQuery] = useState('');
 
-  const { rows, total, loading, error } = useTrips({
+  const { rows, total, loading, error, reload } = useTrips({
     status: status === 'all' ? undefined : status,
     enrich: true,
   });
+
+  // Delete flow: confirm, call the existing DELETE endpoint, then refetch so
+  // the list and the summary counts move together.
+  const [pendingDelete, setPendingDelete] = useState<Trip | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleted, setDeleted] = useState<string | null>(null);
+
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await api.deleteTrip(pendingDelete.id);
+      setDeleted(`Trip to ${pendingDelete.dropoff_location_text} deleted.`);
+      setPendingDelete(null);
+      reload();
+      window.setTimeout(() => setDeleted(null), 4000);
+    } catch (cause) {
+      setDeleteError(
+        cause instanceof ApiError ? cause.message : 'Could not delete this trip. Try again.',
+      );
+    } finally {
+      setDeleting(false);
+    }
+  }
 
   const counts = useMemo(() => computeKpis(rows.map((row) => row.trip)), [rows]);
 
@@ -175,6 +203,25 @@ export function HistoryPage() {
         </div>
       </Card>
 
+      {/* Success and failure feedback for the delete flow. */}
+      {deleted && (
+        <p
+          role="status"
+          className="flex items-center gap-2 rounded-lg border border-green-200 bg-green-50 px-4 py-2.5 text-sm font-medium text-green-800"
+        >
+          <Check aria-hidden="true" className="h-4 w-4" />
+          {deleted}
+        </p>
+      )}
+      {deleteError && (
+        <p
+          role="alert"
+          className="rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm font-medium text-red-700"
+        >
+          {deleteError}
+        </p>
+      )}
+
       {loading && <HistorySkeleton />}
 
       {!loading && error && (
@@ -257,12 +304,31 @@ export function HistoryPage() {
           {visible.length > 0 && (
             <ul className="space-y-3">
               {visible.map((row) => (
-                <TripCard key={row.trip.id} trip={row.trip} arrival={row.arrival} />
+                <TripCard
+                  key={row.trip.id}
+                  trip={row.trip}
+                  arrival={row.arrival}
+                  onDelete={setPendingDelete}
+                />
               ))}
             </ul>
           )}
         </>
       )}
+      <ConfirmDialog
+        open={pendingDelete !== null}
+        busy={deleting}
+        title="Delete this trip?"
+        message="The trip, its route and its timeline will be permanently removed. This cannot be undone."
+        detail={
+          pendingDelete
+            ? `${pendingDelete.current_location_text} → ${pendingDelete.pickup_location_text} → ${pendingDelete.dropoff_location_text}`
+            : undefined
+        }
+        confirmLabel="Delete trip"
+        onConfirm={confirmDelete}
+        onCancel={() => setPendingDelete(null)}
+      />
     </div>
   );
 }

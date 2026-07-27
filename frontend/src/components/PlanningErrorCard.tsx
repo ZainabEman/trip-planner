@@ -12,6 +12,7 @@
  */
 import { AlertTriangle, RefreshCw, WifiOff } from 'lucide-react';
 import { ApiError } from '../lib/apiClient';
+import { explanationFor, readClock } from '../lib/hosExplanations';
 import { Button } from './ui/Button';
 import { Disclosure } from './ui/Disclosure';
 
@@ -129,6 +130,8 @@ function friendlyFor(error: ApiError): Friendly {
 
 export function PlanningErrorCard({ error, onRetry }: PlanningErrorCardProps) {
   const friendly = friendlyFor(error);
+  const rule = explanationFor(error.ruleId);
+  const clock = rule ? readClock(error.message, rule) : null;
   const isOffline = error.statusCode === 0;
   const Icon = isOffline ? WifiOff : AlertTriangle;
 
@@ -149,7 +152,85 @@ export function PlanningErrorCard({ error, onRetry }: PlanningErrorCardProps) {
       </div>
 
       <div className="space-y-4 px-5 py-4">
-        <dl className="space-y-3">
+        {/*
+          When the block came from a named rule we can say considerably more
+          than the generic branches below: what the limit is, how much of it was
+          already spent, what was attempted, and which remedy clears it. All of
+          it is derived from `rule_id` plus the engine's own message — see
+          lib/hosExplanations.ts.
+        */}
+        {rule && (
+          <div className="rounded-lg border border-gray-200 bg-slate-50 p-4">
+            <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+              <h3 className="text-sm font-semibold text-slate-900">{rule.name}</h3>
+              <span className="rounded-md bg-white px-1.5 py-0.5 font-mono text-xs font-medium text-slate-600 ring-1 ring-gray-200">
+                {rule.ruleId}
+              </span>
+              <span className="text-xs text-slate-500">Limit: {rule.limit}</span>
+            </div>
+
+            <dl className="mt-3 space-y-2.5 text-sm">
+              <div>
+                <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  What happened
+                </dt>
+                <dd className="mt-0.5 leading-relaxed text-slate-700">{rule.what}</dd>
+              </div>
+              <div>
+                <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  Why it happened
+                </dt>
+                <dd className="mt-0.5 leading-relaxed text-slate-700">{rule.why}</dd>
+              </div>
+              <div>
+                <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                  What the planner did
+                </dt>
+                <dd className="mt-0.5 leading-relaxed text-slate-700">
+                  Stopped before the limit was broken and returned no schedule, rather than
+                  producing an illegal plan. The legal remedy is a{' '}
+                  <strong className="font-semibold">{rule.remedyLabel}</strong>, which this version
+                  does not yet insert automatically.
+                </dd>
+              </div>
+            </dl>
+
+            {clock && (
+              <dl className="mt-3 grid grid-cols-2 gap-3 border-t border-gray-200 pt-3 sm:grid-cols-4">
+                {[
+                  { label: 'Already used', value: clock.used },
+                  { label: 'Remaining', value: clock.remaining, emphasis: true },
+                  { label: 'Needed for this leg', value: clock.attempted },
+                  { label: 'Would reach', value: clock.projected, over: true },
+                ].map((item) => (
+                  <div key={item.label}>
+                    <dt className="text-xs text-slate-500">{item.label}</dt>
+                    <dd
+                      className={[
+                        'mt-0.5 text-sm font-semibold tabular-nums',
+                        item.over
+                          ? 'text-red-700'
+                          : item.emphasis
+                            ? 'text-blue-700'
+                            : 'text-slate-900',
+                      ].join(' ')}
+                    >
+                      {item.value.toLocaleString('en-US', { maximumFractionDigits: 2 })}
+                      {clock.unit === 'h' ? ' h' : ' mi'}
+                    </dd>
+                  </div>
+                ))}
+              </dl>
+            )}
+
+            <p className="mt-3 border-t border-gray-200 pt-3 text-sm leading-relaxed text-slate-700">
+              <span className="font-semibold">What to do: </span>
+              {rule.suggestion}
+            </p>
+          </div>
+        )}
+
+        <dl className={rule ? 'hidden' : 'space-y-3'}>
           <div>
             <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">Reason</dt>
             <dd className="mt-1 text-sm leading-relaxed text-slate-700">{friendly.reason}</dd>

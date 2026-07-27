@@ -1,21 +1,37 @@
 """PlanningEngine — the single entry point into the HOS planning pipeline.
 
-Executes the registered RuleEvaluators (in priority order) against each
-RouteLeg's driving demand in turn, accumulating cumulative driving hours,
-elapsed duty-window hours, cumulative distance, and cumulative cycle
-hours as it goes. As soon as any evaluator blocks a leg, the engine stops
-processing further legs — no remedy is scheduled *mid-trip* yet, so
-halting remains the only correct behavior there.
+An **iterative scheduler**, not a single pass over legs. The engine walks a
+queue of `PlannerAction`s against a `PlanningCursor` that carries the clock,
+the route position and the accumulating timeline. Each turn of the loop takes
+the next action, evaluates it if it consumes driving time, advances the cursor,
+and continues until the destination is reached or planning pauses.
 
-The one exception, and the only remedy this phase schedules, is the
-**pre-flight** 34-hour restart: a driver who arrives with an already
-exhausted 70-hour cycle (BR-8) needs a restart before any driving is
-attempted, and that restart sits at the trip's start location on the
-trip's start time, so it needs neither route-geometry interpolation nor
-mid-leg splitting to place. See `_apply_preflight_restart`.
+    while not cursor.destination_reached:
+        action = next action for the cursor
+        if action consumes driving time:
+            evaluate against the current clocks
+            if blocked: record the pause and stop
+        emit the event and advance the cursor
 
-A successful plan produces a contiguous, gap-free timeline spanning trip
-start to delivery completion exactly (FR-4.1, FR-4.5):
+No recursion, and one place where each kind of event is emitted.
+
+The trip is no longer assumed to fit in a single duty window: the cursor tracks
+cycle hours and elapsed time across the whole run, and the finished timeline is
+grouped into `PlanningDay`s so a multi-day schedule is representable.
+
+Behaviour this phase deliberately leaves unchanged:
+
+* **A blocked leg still yields no events.** The engine records a `PlanningPause`
+  describing where it stopped and how much of the leg remains, but returns an
+  empty timeline — emitting a plan that stops short of the delivery would break
+  FR-4.5 and BR-37. Phase 12B turns that pause into an inserted remedy.
+* **One evaluation per leg, first block wins by priority.** Splitting a leg into
+  several evaluated increments changes which rule binds first, so it waits for
+  12B's nearest-binding-constraint work.
+* **The pre-flight 34-hour restart** remains the only remedy scheduled.
+
+A successful plan produces a contiguous, gap-free timeline spanning trip start
+to delivery completion exactly (FR-4.1, FR-4.5):
 
     Pre-Trip Inspection (BR-21, opens the 14h window per BR-24)
       -> Driving        (leg 1)
@@ -24,30 +40,10 @@ start to delivery completion exactly (FR-4.1, FR-4.5):
       -> Dropoff        (BR-18, 1 h On Duty)
       -> Post-Trip Inspection (BR-22, closes the duty period)
 
-with a Cycle Restart (34-hr) plus its own Pre-Trip Inspection prepended
-when the cycle arrives exhausted. Every event is built by EventFactory and
-numbered by TimelineBuilder; this module constructs neither an EngineEvent
-nor a sequence number itself.
-
-If any leg is blocked, the engine returns **no events at all** rather than
-a timeline that stops short of the delivery — see `plan`.
-
-Deliberately still absent (each belongs to a later phase, not here):
-
-* **Mid-trip remedies** — the 30-minute break, 10-hour reset, fuel stop,
-  and mid-trip restart. Evaluators already detect and name all four via
-  `RuleResult.required_action`; nothing schedules them yet, so a leg that
-  needs one is reported as unplannable rather than silently mis-planned.
-* **Mid-leg event placement (BR-36).** One Driving event per leg is the
-  finest granularity available: splitting a leg at an arbitrary mileage
-  needs route geometry `RouteLegInput` does not carry (it has endpoints
-  only), so a rule boundary cannot yet be resolved to a place name.
-* **Nearest-binding-constraint selection.** The evaluator loop still
-  returns on the first block by priority. Safe while the only remedy
-  scheduled is the pre-flight one — evaluated before any clock but the
-  cycle has advanced, so no other rule can be binding at that moment.
-* **StateMachine** remains unused; the Timeline is the single record of
-  duty-status transitions (domain-analysis.md §3.4).
+with a Cycle Restart (34-hr) plus its own Pre-Trip Inspection prepended when the
+cycle arrives exhausted. Every event is built by EventFactory and numbered by
+TimelineBuilder; this module constructs neither an EngineEvent nor a sequence
+number itself, and every clock movement goes through `PlanningCursor.advance`.
 """
 from __future__ import annotations
 
@@ -62,6 +58,7 @@ from apps.planning.services.hos.constants import (
     POSTTRIP_INSPECTION_HOURS,
     PRETRIP_INSPECTION_HOURS,
 )
+from apps.planning.services.hos.cursor import PlannerAction, PlanningCursor, group_into_days
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
 from apps.planning.services.hos.event_factory import EventFactory
 from apps.planning.services.hos.models import (
@@ -73,7 +70,6 @@ from apps.planning.services.hos.models import (
     RouteLegInput,
     RuleResult,
 )
-from apps.planning.services.hos.timeline_builder import TimelineBuilder
 
 
 class PlanningEngine:
@@ -91,78 +87,113 @@ class PlanningEngine:
         self._evaluators = sorted(evaluators or [], key=lambda evaluator: evaluator.priority())
 
     def plan(self, context: PlanningContext) -> PlanningResult:
-        current_time = context.trip_start_time
-        cumulative_driving_hours = Decimal('0')
-        elapsed_duty_window_hours = Decimal('0')
-        cumulative_distance_miles = Decimal('0')
-        cumulative_cycle_hours = context.cycle_hours_used
-        rule_results: list[RuleResult] = []
-        timeline = TimelineBuilder()
+        """Plan one trip by walking actions against a cursor until done.
 
-        preflight = self._apply_preflight_restart(context, timeline, current_time, cumulative_cycle_hours)
-        if preflight is not None:
-            current_time, cumulative_cycle_hours, elapsed_duty_window_hours, blocking_result = preflight
-            rule_results.append(blocking_result)
-        else:
-            # Open the first duty period (BR-21). When a pre-flight restart
-            # ran it already emitted this inspection for the duty period it
-            # opened, so emitting a second one here would double it.
-            current_time = self._emit_pretrip_inspection(context, timeline, current_time)
-            elapsed_duty_window_hours += PRETRIP_INSPECTION_HOURS  # BR-24
-            cumulative_cycle_hours += PRETRIP_INSPECTION_HOURS  # BR-8
+        The cursor holds every piece of state the run needs; this method only
+        decides which action comes next and reacts to the evaluators.
+        """
+        cursor = PlanningCursor(
+            trip_start_time=context.trip_start_time,
+            cycle_hours_used=context.cycle_hours_used,
+            leg_count=len(context.route_legs),
+        )
 
-        blocked = False
-        last_index = len(context.route_legs) - 1
+        self._open_first_duty_period(context, cursor)
 
-        for index, leg in enumerate(context.route_legs):
-            eval_context = EvaluationContext(
-                cumulative_driving_hours=cumulative_driving_hours,
-                elapsed_duty_window_hours=elapsed_duty_window_hours,
-                proposed_driving_hours=leg.duration_hours,
-                cumulative_distance_miles=cumulative_distance_miles,
-                proposed_distance_miles=leg.distance_miles,
-                cumulative_cycle_hours=cumulative_cycle_hours,
-            )
+        # ---- the planning loop ----------------------------------------
+        # One turn per remaining leg today, because a leg is still the finest
+        # driving increment. The loop is written against the cursor rather than
+        # an index so 12B can push remedy actions into the same run without
+        # restructuring it.
+        while not cursor.destination_reached and not cursor.paused:
+            leg = context.route_legs[cursor.leg_index]
 
-            leg_results, blocking_result = self._run_evaluators(eval_context)
-            rule_results.extend(leg_results)
-
-            if blocking_result is not None:
-                blocked = True
+            # DRIVING is the only action that consumes driving time, so it is
+            # the only one the rules gate.
+            blocking = self._evaluate_driving(cursor, leg)
+            if blocking is not None:
+                cursor.record_pause(
+                    leg_sequence=leg.sequence,
+                    blocking=blocking,
+                    leg_duration_minutes=leg.duration_minutes,
+                    leg_distance_miles=leg.distance_miles,
+                )
                 break
 
-            current_time = self._emit_driving(leg, timeline, current_time)
+            self._perform_driving(cursor, leg)
+            self._perform_arrival(context, cursor, leg)
+            cursor.complete_leg()
 
-            cumulative_driving_hours += leg.duration_hours
-            elapsed_duty_window_hours += leg.duration_hours
-            cumulative_distance_miles += leg.distance_miles
-            # Driving is on-duty time, so it accrues against the cycle (BR-8).
-            cumulative_cycle_hours += leg.duration_hours
-
-            # The final leg ends at the delivery; every earlier one ends at a
-            # pickup (BR-17/BR-18). With BR-23's fixed two-leg route that is
-            # leg 1 -> Pickup, leg 2 -> Dropoff, but expressing it by position
-            # rather than by hardcoding "leg 2" keeps the loop correct for the
-            # single-leg contexts the test suite also exercises.
-            current_time, on_duty_hours = self._emit_arrival(
-                context, timeline, current_time, leg, is_final=index == last_index
-            )
-            elapsed_duty_window_hours += on_duty_hours
-            cumulative_cycle_hours += on_duty_hours
-
-        # A blocked leg means no legal continuation exists for a remedy this
-        # phase can schedule, so the events accumulated so far describe an
-        # incomplete trip. Returning them would be a partial plan that stops
-        # short of the delivery, which BR-37/NFR-2.4 forbid and which would
-        # break the Timeline's "spans trip start to delivery completion
-        # exactly" invariant (FR-4.5). The RuleResults still explain why.
-        events = () if blocked else tuple(timeline.build())
+        # A pause means no legal continuation exists for a remedy this phase
+        # can schedule, so the events accumulated so far describe an incomplete
+        # trip. Returning them would be a partial plan that stops short of the
+        # delivery, which BR-37/NFR-2.4 forbid and which would break the
+        # Timeline's "spans trip start to delivery completion exactly"
+        # invariant (FR-4.5). The RuleResults and the pause still explain why.
+        events: tuple = () if cursor.paused else tuple(cursor.timeline.build())
 
         return PlanningResult(
             context=context,
             events=events,
-            rule_results=tuple(rule_results),
+            rule_results=tuple(cursor.rule_results),
+            days=group_into_days(events),
+            pause=cursor.pause,
         )
+
+    # ------------------------------------------------------------------
+    # Actions
+    # ------------------------------------------------------------------
+
+    def _open_first_duty_period(self, context: PlanningContext, cursor: PlanningCursor) -> None:
+        """Start the trip: a pre-flight restart if the cycle is exhausted,
+        otherwise the pre-trip inspection that opens the first duty period.
+
+        A restart emits its own inspection, so only one of the two paths runs.
+        """
+        if self._apply_preflight_restart(context, cursor):
+            return
+
+        # Open the first duty period (BR-21). The 14-hour window opens at the
+        # start of this inspection, not at the first driving minute (BR-24).
+        self._emit_pretrip_inspection(context, cursor)
+
+    def _evaluate_driving(
+        self, cursor: PlanningCursor, leg: RouteLegInput
+    ) -> RuleResult | None:
+        """Ask the rules whether the next driving increment is allowed.
+
+        Records every result produced onto the cursor and returns the blocking
+        one, or None. One evaluation per leg, first block wins by priority —
+        unchanged, because splitting a leg into several evaluated increments
+        would change which rule binds first.
+        """
+        eval_context = EvaluationContext(
+            cumulative_driving_hours=cursor.clocks.driving_hours,
+            elapsed_duty_window_hours=cursor.clocks.duty_window_hours,
+            proposed_driving_hours=leg.duration_hours,
+            cumulative_distance_miles=cursor.clocks.distance_miles,
+            proposed_distance_miles=leg.distance_miles,
+            cumulative_cycle_hours=cursor.clocks.cycle_hours,
+        )
+        results, blocking = self._run_evaluators(eval_context)
+        cursor.rule_results.extend(results)
+        return blocking
+
+    def _perform_driving(self, cursor: PlanningCursor, leg: RouteLegInput) -> None:
+        """Emit the leg's Driving event and advance the cursor by it."""
+        self._emit_driving(leg, cursor)
+
+    def _perform_arrival(
+        self, context: PlanningContext, cursor: PlanningCursor, leg: RouteLegInput
+    ) -> None:
+        """Emit the on-duty work waiting at the end of the current leg.
+
+        The final leg ends at the delivery; every earlier one ends at a pickup
+        (BR-17/BR-18). Expressed by cursor position rather than by hardcoding
+        "leg 2" so the loop stays correct for the single-leg contexts the test
+        suite also exercises.
+        """
+        self._emit_arrival(context, cursor, leg, is_final=cursor.is_final_leg)
 
     def _run_evaluators(
         self, eval_context: EvaluationContext
@@ -193,9 +224,7 @@ class PlanningEngine:
         """
         return timedelta(minutes=int(hours * MINUTES_PER_HOUR))
 
-    def _emit_pretrip_inspection(
-        self, context: PlanningContext, timeline: TimelineBuilder, start: datetime
-    ) -> datetime:
+    def _emit_pretrip_inspection(self, context: PlanningContext, cursor: PlanningCursor) -> None:
         """Open a duty period with a 15-minute pre-trip inspection (BR-21).
 
         Placed at the trip's start location. Because this is the timeline's
@@ -204,8 +233,9 @@ class PlanningEngine:
         minute (BR-24).
         """
         origin = context.route_legs[0]
+        start = cursor.current_time
         end = start + self._duration(PRETRIP_INSPECTION_HOURS)
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=start,
                 end_time=end,
@@ -220,11 +250,9 @@ class PlanningEngine:
                 ),
             )
         )
-        return end
+        cursor.advance(PlannerAction.PRETRIP, PRETRIP_INSPECTION_HOURS)
 
-    def _emit_driving(
-        self, leg: RouteLegInput, timeline: TimelineBuilder, start: datetime
-    ) -> datetime:
+    def _emit_driving(self, leg: RouteLegInput, cursor: PlanningCursor) -> None:
         """Emit one Driving event covering a whole leg.
 
         One event per leg, not per rule-boundary: splitting a leg at an
@@ -238,10 +266,12 @@ class PlanningEngine:
         event at all rather than a zero-length one, per BR-35.
         """
         if leg.duration_minutes == 0:
-            return start
+            # EC-1: a same-location hop passes no time and moves no clock.
+            return
 
+        start = cursor.current_time
         end = start + timedelta(minutes=leg.duration_minutes)
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=start,
                 end_time=end,
@@ -257,16 +287,22 @@ class PlanningEngine:
                 distance_miles=leg.distance_miles,
             )
         )
-        return end
+        # Driving accrues against the driving clock, the duty window and the
+        # cycle at once — advance() is what keeps them from diverging.
+        cursor.advance_minutes(
+            PlannerAction.DRIVING,
+            leg.duration_minutes,
+            distance_miles=leg.distance_miles,
+            counts_as_driving=True,
+        )
 
     def _emit_arrival(
         self,
         context: PlanningContext,
-        timeline: TimelineBuilder,
-        start: datetime,
+        cursor: PlanningCursor,
         leg: RouteLegInput,
         is_final: bool,
-    ) -> tuple[datetime, Decimal]:
+    ) -> None:
         """Emit the on-duty work waiting at the end of a leg.
 
         Returns the advanced clock and the on-duty hours consumed, which the
@@ -286,9 +322,11 @@ class PlanningEngine:
         dropoff-then-post-trip, which is what BR-22's own trigger ("end of
         each duty period, last driving segment complete") describes.
         """
+        start = cursor.current_time
+
         if not is_final:
             end = start + self._duration(PICKUP_HOURS)
-            timeline.add_event(
+            cursor.timeline.add_event(
                 EventFactory.create_event(
                     start_time=start,
                     end_time=end,
@@ -300,10 +338,11 @@ class PlanningEngine:
                     reason=f'Loading at pickup: {context.pickup_location_text} (BR-17).',
                 )
             )
-            return end, PICKUP_HOURS
+            cursor.advance(PlannerAction.PICKUP, PICKUP_HOURS)
+            return
 
         dropoff_end = start + self._duration(DROPOFF_HOURS)
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=start,
                 end_time=dropoff_end,
@@ -315,9 +354,10 @@ class PlanningEngine:
                 reason=f'Unloading at dropoff: {context.dropoff_location_text} (BR-18).',
             )
         )
+        cursor.advance(PlannerAction.DROPOFF, DROPOFF_HOURS)
 
         posttrip_end = dropoff_end + self._duration(POSTTRIP_INSPECTION_HOURS)
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=dropoff_end,
                 end_time=posttrip_end,
@@ -332,22 +372,18 @@ class PlanningEngine:
                 ),
             )
         )
-        return posttrip_end, DROPOFF_HOURS + POSTTRIP_INSPECTION_HOURS
+        cursor.advance(PlannerAction.POSTTRIP, POSTTRIP_INSPECTION_HOURS)
 
     def _apply_preflight_restart(
-        self,
-        context: PlanningContext,
-        timeline: TimelineBuilder,
-        current_time: datetime,
-        cumulative_cycle_hours: Decimal,
-    ) -> tuple[datetime, Decimal, Decimal, RuleResult] | None:
+        self, context: PlanningContext, cursor: PlanningCursor
+    ) -> bool:
         """Insert a 34-hour restart before any driving if the cycle is
         already exhausted at trip start (BR-8/BR-10, AC-11, EC-4/EC-44).
 
-        Returns the advanced clock, the reset cycle total, the elapsed
-        duty-window hours for the newly opened duty period, and the
-        RuleResult that triggered the restart — or None if no restart is
-        due, which is the overwhelmingly common case.
+        Returns True when a restart was inserted — in which case it has also
+        emitted the pre-trip inspection that opens the duty period after it,
+        and advanced the cursor past both. False is the overwhelmingly common
+        case, and leaves the cursor untouched.
 
         The condition is detected by *asking the evaluators*, using a
         zero-hour proposed increment, rather than by restating the 70-hour
@@ -374,12 +410,16 @@ class PlanningEngine:
             cumulative_driving_hours=Decimal('0'),
             elapsed_duty_window_hours=Decimal('0'),
             proposed_driving_hours=Decimal('0'),
-            cumulative_cycle_hours=cumulative_cycle_hours,
+            cumulative_cycle_hours=cursor.clocks.cycle_hours,
         )
         _, blocking_result = self._run_evaluators(probe)
 
         if blocking_result is None or blocking_result.required_action is not RequiredAction.RESTART_34:
-            return None
+            return False
+
+        # Only the blocking result is recorded: the probe's allowed results are
+        # a guard, not part of the per-leg audit trail.
+        cursor.rule_results.append(blocking_result)
 
         # Both events sit at the trip's start location. PlanningContext
         # guarantees at least one leg, and no interpolation is needed
@@ -392,8 +432,9 @@ class PlanningEngine:
 
         # Converted to whole minutes so the clock arithmetic stays exact —
         # both durations are exact multiples of a minute by construction.
+        current_time = cursor.current_time
         restart_end = current_time + timedelta(minutes=int(CYCLE_RESTART_HOURS * MINUTES_PER_HOUR))
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=current_time,
                 end_time=restart_end,
@@ -407,11 +448,18 @@ class PlanningEngine:
                 reason=blocking_result.reason,
             )
         )
+        # 34 hours off duty: time passes, but no duty or cycle hours accrue,
+        # and the restart clears the cycle entirely (BR-10).
+        cursor.advance(
+            PlannerAction.CYCLE_RESTART, CYCLE_RESTART_HOURS, counts_as_on_duty=False
+        )
+        cursor.reset_cycle()
+        cursor.open_new_duty_period()
 
         inspection_end = restart_end + timedelta(
             minutes=int(PRETRIP_INSPECTION_HOURS * MINUTES_PER_HOUR)
         )
-        timeline.add_event(
+        cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=restart_end,
                 end_time=inspection_end,
@@ -426,14 +474,8 @@ class PlanningEngine:
                 ),
             )
         )
-
-        # The restart clears the cycle (BR-10); the inspection that follows
-        # is on-duty time, so it immediately accrues against the fresh
-        # cycle total (BR-8) and against the duty window it just opened
-        # (BR-24).
-        return (
-            inspection_end,
-            PRETRIP_INSPECTION_HOURS,
-            PRETRIP_INSPECTION_HOURS,
-            blocking_result,
-        )
+        # The inspection that follows is on-duty time, so it immediately
+        # accrues against the fresh cycle total (BR-8) and against the duty
+        # window it just opened (BR-24).
+        cursor.advance(PlannerAction.PRETRIP, PRETRIP_INSPECTION_HOURS)
+        return True

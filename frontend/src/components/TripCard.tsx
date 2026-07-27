@@ -17,6 +17,7 @@ import {
   Gauge,
   MapPin,
   Timer,
+  Trash2,
 } from 'lucide-react';
 import type { Trip, TripStatus } from '../types/api';
 import { formatDateTime, formatDuration, formatMiles } from '../lib/format';
@@ -29,6 +30,8 @@ interface TripCardProps {
   trip: Trip;
   /** Resolved arrival, or undefined while the enrichment pass is still loading. */
   arrival?: string | null;
+  /** When given, a delete control is shown. Omitted on read-only lists. */
+  onDelete?: (trip: Trip) => void;
 }
 
 function legalityTone(status: TripStatus) {
@@ -40,7 +43,7 @@ function legalityTone(status: TripStatus) {
 const LEG_ICON = 'h-3.5 w-3.5 shrink-0 text-slate-400';
 const METRIC_ICON = 'h-3.5 w-3.5';
 
-export function TripCard({ trip, arrival }: TripCardProps) {
+export function TripCard({ trip, arrival, onDelete }: TripCardProps) {
   const legs = [
     { icon: <Circle className={LEG_ICON} />, label: 'Origin', value: trip.current_location_text },
     { icon: <MapPin className={LEG_ICON} />, label: 'Pickup', value: trip.pickup_location_text },
@@ -74,13 +77,15 @@ export function TripCard({ trip, arrival }: TripCardProps) {
   ];
 
   return (
-    <li>
+    <li className="relative">
       <a
         href={tripHref(trip.id)}
         className="group block rounded-xl border border-gray-200 bg-white p-5 shadow-sm transition-colors hover:border-blue-300"
       >
         {/* Route */}
-        <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
+        <div
+          className={`flex flex-wrap items-start justify-between gap-x-4 gap-y-3 ${onDelete ? 'pr-9' : ''}`}
+        >
           <ol className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             {legs.map((leg, index) => (
               <li key={leg.label} className="flex items-center gap-2">
@@ -138,6 +143,23 @@ export function TripCard({ trip, arrival }: TripCardProps) {
           </span>
         </div>
       </a>
+
+      {/*
+        Delete sits outside the anchor — a button may not nest inside a link,
+        and the two need separate hit targets. Overlaid on the card's corner,
+        with the header padded to keep it clear of the badges.
+      */}
+      {onDelete && (
+        <button
+          type="button"
+          onClick={() => onDelete(trip)}
+          title={`Delete trip to ${trip.dropoff_location_text}`}
+          aria-label={`Delete trip from ${trip.current_location_text} to ${trip.dropoff_location_text}`}
+          className="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-lg text-slate-400 transition-colors hover:bg-red-50 hover:text-red-600"
+        >
+          <Trash2 aria-hidden="true" className="h-4 w-4" />
+        </button>
+      )}
     </li>
   );
 }

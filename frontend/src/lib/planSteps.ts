@@ -17,6 +17,7 @@
  * `location`/`origin` detail means routing failed. Nothing here is invented.
  */
 import { ApiError } from './apiClient';
+import { remedyLabelFor } from './hosExplanations';
 import type { PlannerPhase } from '../hooks/useTripPlanner';
 import type { TripPlan } from '../types/api';
 
@@ -61,7 +62,14 @@ function detailFor(
   error: ApiError | null,
 ): string | undefined {
   if (state === 'failed') {
-    if (id === 'rules' && error?.ruleId) return `Blocked by ${error.ruleId}`;
+    if (id === 'rules' && error?.ruleId) {
+      // Name the remedy the rule calls for, so the log says what is needed
+      // rather than only what failed.
+      const remedy = remedyLabelFor(error.ruleId);
+      return remedy
+        ? `Blocked by ${error.ruleId} — needs a ${remedy}`
+        : `Blocked by ${error.ruleId}`;
+    }
     if (id === 'route' && error?.details.location)
       return `Could not locate ${error.details.location}`;
     if (id === 'route' && error?.details.origin) return 'No drivable route between two points';

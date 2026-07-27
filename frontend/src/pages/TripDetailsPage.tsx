@@ -25,6 +25,7 @@ import { stepsFromStoredTrip } from '../lib/planSteps';
 import { summaryFromStored } from '../lib/tripMetrics';
 import type { RouteLeg, TimelineEvent, Trip } from '../types/api';
 import { PlanningActivityLog } from '../components/PlanningActivityLog';
+import { DutyStatusGraph } from '../components/DutyStatusGraph';
 import { RoutePanel } from '../components/RoutePanel';
 import { SummaryCard } from '../components/SummaryCard';
 import { SummarySkeleton, TimelineSkeleton } from '../components/Skeletons';
@@ -48,6 +49,8 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
   const [error, setError] = useState<ApiError | null>(null);
   const [loading, setLoading] = useState(true);
   const [reloadToken, setReloadToken] = useState(0);
+  /** Event highlighted in both the graph and the timeline list. */
+  const [selected, setSelected] = useState<number | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -200,9 +203,16 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
       {/* 2 — Trip summary */}
       {planned && <SummaryCard summary={summary} planningStatus={trip.status} />}
 
-      {/* 3 & 4 — Route beside the timeline on desktop */}
+      {/* 3 — Duty status graph, the dispatcher's log view */}
+      <DutyStatusGraph
+        events={timeline}
+        selectedSequence={selected}
+        onSelect={(event) => setSelected(event ? event.sequence : null)}
+      />
+
+      {/* 4 & 5 — Route beside the timeline on desktop */}
       <div className="grid items-start gap-6 lg:grid-cols-2">
-        <TimelineList events={timeline} />
+        <TimelineList events={timeline} selectedSequence={selected} onSelect={setSelected} />
         <RoutePanel route={route} timeline={timeline} />
       </div>
 

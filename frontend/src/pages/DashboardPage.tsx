@@ -34,7 +34,6 @@ import { computeAnalytics, computeKpis } from '../lib/tripStats';
 import { DashboardSkeleton } from '../components/Skeletons';
 import { KpiCard } from '../components/KpiCard';
 import { OperationsActivityFeed } from '../components/OperationsActivityFeed';
-import { ReferenceLinks } from '../components/ReferenceLinks';
 import { TripCard } from '../components/TripCard';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -120,8 +119,6 @@ export function DashboardPage() {
           />
         </Card>
       )}
-
-      {!loading && !error && kpis.total === 0 && <ReferenceLinks />}
 
       {!loading && !error && kpis.total > 0 && (
         <>
@@ -305,8 +302,6 @@ export function DashboardPage() {
               </ul>
             </Card>
           </div>
-
-          <ReferenceLinks />
         </>
       )}
 

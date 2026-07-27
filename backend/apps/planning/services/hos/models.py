@@ -18,6 +18,14 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Import-time cycle: cursor.py needs this module's DTOs, so its own types
+    # are referenced here only for annotations. `from __future__ import
+    # annotations` above makes every annotation a string, so nothing is
+    # evaluated at runtime.
+    from apps.planning.services.hos.cursor import PlanningDay, PlanningPause
 
 from apps.planning.choices import DutyStatus, EventType
 from apps.planning.services.hos.exceptions import (
@@ -220,11 +228,30 @@ class RuleResult:
 
 @dataclass(frozen=True)
 class PlanningResult:
-    """Successful output of the planning pipeline."""
+    """Successful output of the planning pipeline.
+
+    `days` and `pause` are additive and default to empty, so every existing
+    construction and every caller that reads only `events`/`rule_results`
+    keeps working unchanged:
+
+    * `days` groups the finished timeline by calendar date. A trip no longer
+      has to fit in one duty period, so the result has to be able to describe
+      more than one day.
+    * `pause` is set instead of `days` when planning stopped short: it records
+      which rule blocked, where on the leg the truck ran out of clock, and how
+      much of the leg is left. Nothing consumes it yet — it is what Phase 12B's
+      remedy insertion resumes from.
+
+    Note that `events` is still empty whenever `pause` is set. The engine does
+    not emit a partial timeline (BR-37/NFR-2.4); the pause is metadata about
+    the stop, not a half-finished plan.
+    """
 
     context: PlanningContext
     events: tuple[EngineEvent, ...]
     rule_results: tuple[RuleResult, ...] = ()
+    days: tuple['PlanningDay', ...] = ()
+    pause: 'PlanningPause | None' = None
 
 
 @dataclass(frozen=True)

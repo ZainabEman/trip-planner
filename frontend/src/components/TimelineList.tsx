@@ -30,7 +30,15 @@ import { CopyButton } from './ui/CopyButton';
 import { Disclosure } from './ui/Disclosure';
 import { EmptyState } from './ui/EmptyState';
 
-export function TimelineRow({ event }: { event: TimelineEvent }) {
+export function TimelineRow({
+  event,
+  selected = false,
+  onSelect,
+}: {
+  event: TimelineEvent;
+  selected?: boolean;
+  onSelect?: (sequence: number | null) => void;
+}) {
   const minutes = durationMinutes(event.start_time, event.end_time);
   const { icon: Icon, plain } = eventMeta(event.event_type);
   const rules = extractRuleIds(event.reason);
@@ -38,7 +46,17 @@ export function TimelineRow({ event }: { event: TimelineEvent }) {
   const coordinates = `${Number(event.latitude).toFixed(6)}, ${Number(event.longitude).toFixed(6)}`;
 
   return (
-    <li className="relative flex gap-4 py-5">
+    <li
+      // Highlighted when the matching bar in the duty graph is active. The
+      // negative margin + padding lets the tint bleed to the card edges.
+      className={[
+        'relative -mx-5 flex gap-4 px-5 py-5 transition-colors',
+        selected ? 'bg-blue-50/60' : '',
+        onSelect ? 'cursor-pointer' : '',
+      ].join(' ')}
+      onClick={onSelect ? () => onSelect(selected ? null : event.sequence) : undefined}
+      aria-current={selected ? 'true' : undefined}
+    >
       {/* Journey node, centred on the connector rail. */}
       <span
         aria-hidden="true"
@@ -141,7 +159,15 @@ export function TimelineRow({ event }: { event: TimelineEvent }) {
   );
 }
 
-export function TimelineList({ events }: { events: TimelineEvent[] }) {
+export function TimelineList({
+  events,
+  selectedSequence = null,
+  onSelect,
+}: {
+  events: TimelineEvent[];
+  selectedSequence?: number | null;
+  onSelect?: (sequence: number | null) => void;
+}) {
   if (events.length === 0) {
     return (
       <Card title="Timeline">
@@ -189,7 +215,11 @@ export function TimelineList({ events }: { events: TimelineEvent[] }) {
                     </p>
                   </li>
                 )}
-                <TimelineRow event={event} />
+                <TimelineRow
+                  event={event}
+                  selected={event.sequence === selectedSequence}
+                  onSelect={onSelect}
+                />
               </Fragment>
             );
           })}

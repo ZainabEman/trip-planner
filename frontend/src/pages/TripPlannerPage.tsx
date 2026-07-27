@@ -18,6 +18,7 @@ import { useTripPlanner } from '../hooks/useTripPlanner';
 import { buildPlanSteps } from '../lib/planSteps';
 import { PlanningActivityLog } from '../components/PlanningActivityLog';
 import { PlanningErrorCard } from '../components/PlanningErrorCard';
+import { DutyStatusGraph } from '../components/DutyStatusGraph';
 import { RoutePanel } from '../components/RoutePanel';
 import { SummaryCard } from '../components/SummaryCard';
 import { TimelineList } from '../components/TimelineList';
@@ -75,7 +76,10 @@ export function TripPlannerPage() {
 
       {phase === 'error' && error && <PlanningErrorCard error={error} onRetry={retry} />}
 
-      {/* 4 & 5 — Timeline beside the map on desktop, stacked below it */}
+      {/* 4 — Duty status graph */}
+      {showResults && plan && <DutyStatusGraph events={plan.timeline} />}
+
+      {/* 5 & 6 — Timeline beside the map on desktop, stacked below it */}
       {showResults && plan && (
         <div className="grid items-start gap-6 lg:grid-cols-2">
           <TimelineList events={plan.timeline} />
