@@ -12,7 +12,7 @@
  * trip details page uses, so a fresh plan and a stored one look identical.
  */
 import { useMemo } from 'react';
-import { ArrowRight, Route as RouteIcon } from 'lucide-react';
+import { ArrowRight } from 'lucide-react';
 import { tripHref } from '../hooks/useHashRoute';
 import { useTripPlanner } from '../hooks/useTripPlanner';
 import { buildPlanSteps } from '../lib/planSteps';
@@ -103,7 +103,7 @@ export function TripPlannerPage() {
       {phase === 'idle' && (
         <Card ariaLabel="Getting started">
           <EmptyState
-            icon={<RouteIcon className="h-5 w-5" />}
+            illustration="trips"
             title="No trip planned yet"
             description="Create a trip to generate a legal driving schedule with route, breaks and rest periods."
           />

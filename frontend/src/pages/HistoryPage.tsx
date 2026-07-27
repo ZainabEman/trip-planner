@@ -1,20 +1,23 @@
 /**
- * Trip history, with search and filters.
+ * Trip history — the operations register.
  *
  * Filter split, forced by the existing API (no new endpoints):
  *  - **status** is a server-side filter (`?status=`), so switching it refetches;
- *  - **text and date** are client-side over the pages already loaded, because
- *    `GET /trips/` has no search parameter.
+ *  - **text, date range and sort** are client-side over the pages already
+ *    loaded, because `GET /trips/` offers neither search nor these orderings.
  *
- * Ordering is newest-first server-side (`?ordering=-created_at`), with a
- * client-side oldest-first toggle over the same loaded set.
+ * The summary row counts the *loaded* set, so it always agrees with the list
+ * below it rather than reporting a server total the list does not show.
  */
 import { useMemo, useState } from 'react';
-import { History as HistoryIcon, Plus, SearchX } from 'lucide-react';
+import { CheckCircle2, Clock, ListChecks, Plus, TriangleAlert } from 'lucide-react';
 import { hrefFor } from '../hooks/useHashRoute';
 import { useTrips } from '../hooks/useTrips';
-import { matchesQuery } from '../lib/tripMetrics';
+import { compareRows, matchesQuery, withinRange } from '../lib/tripMetrics';
+import type { DateRange, SortKey } from '../lib/tripMetrics';
+import { computeKpis } from '../lib/tripStats';
 import type { TripStatus } from '../types/api';
+import { HistorySkeleton } from '../components/Skeletons';
 import { TripCard } from '../components/TripCard';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -22,10 +25,8 @@ import { EmptyState } from '../components/ui/EmptyState';
 import { FilterTabs } from '../components/ui/FilterTabs';
 import { PageHeader } from '../components/ui/PageHeader';
 import { SearchInput } from '../components/ui/SearchInput';
-import { Spinner } from '../components/ui/Spinner';
 
 type StatusFilter = 'all' | TripStatus;
-type SortOrder = 'newest' | 'oldest';
 
 const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'all', label: 'All' },
@@ -34,33 +35,96 @@ const STATUS_OPTIONS: { value: StatusFilter; label: string }[] = [
   { value: 'pending', label: 'Pending' },
 ];
 
-const SORT_OPTIONS: { value: SortOrder; label: string }[] = [
-  { value: 'newest', label: 'Newest first' },
-  { value: 'oldest', label: 'Oldest first' },
+const RANGE_OPTIONS: { value: DateRange; label: string }[] = [
+  { value: 'today', label: 'Today' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: '30d', label: 'Last 30 days' },
+  { value: 'all', label: 'All time' },
 ];
+
+const SORT_OPTIONS: { value: SortKey; label: string }[] = [
+  { value: 'newest', label: 'Newest' },
+  { value: 'oldest', label: 'Oldest' },
+  { value: 'distance', label: 'Distance' },
+  { value: 'driving', label: 'Driving hours' },
+  { value: 'arrival', label: 'Arrival' },
+  { value: 'alphabetical', label: 'A–Z' },
+];
+
+/** Empty-state copy per status filter, so each dead end explains itself. */
+const NO_MATCH_FOR_STATUS: Record<
+  Exclude<StatusFilter, 'all'>,
+  { illustration: 'planned' | 'failed' | 'timeline'; title: string; description: string }
+> = {
+  planned: {
+    illustration: 'planned',
+    title: 'No planned trips',
+    description: 'No trip has produced a legal schedule yet. Plan one to see it here.',
+  },
+  failed: {
+    illustration: 'failed',
+    title: 'No failed trips',
+    description: 'Nothing has been rejected by the hours-of-service rules. That is good news.',
+  },
+  pending: {
+    illustration: 'timeline',
+    title: 'No pending trips',
+    description: 'Every trip has been through the planner — none are waiting.',
+  },
+};
 
 export function HistoryPage() {
   const [status, setStatus] = useState<StatusFilter>('all');
+  const [range, setRange] = useState<DateRange>('all');
+  const [sort, setSort] = useState<SortKey>('newest');
   const [query, setQuery] = useState('');
-  const [fromDate, setFromDate] = useState('');
-  const [sort, setSort] = useState<SortOrder>('newest');
 
   const { rows, total, loading, error } = useTrips({
     status: status === 'all' ? undefined : status,
     enrich: true,
   });
 
-  const visible = useMemo(() => {
-    const filtered = rows.filter((row) => {
-      if (!matchesQuery(row.trip, query)) return false;
-      if (fromDate && row.trip.created_at.slice(0, 10) < fromDate) return false;
-      return true;
-    });
-    // The server already returned newest-first; only "oldest" needs reversing.
-    return sort === 'oldest' ? [...filtered].reverse() : filtered;
-  }, [rows, query, fromDate, sort]);
+  const counts = useMemo(() => computeKpis(rows.map((row) => row.trip)), [rows]);
 
-  const isFiltered = Boolean(query.trim() || fromDate);
+  const visible = useMemo(() => {
+    const filtered = rows.filter(
+      (row) => matchesQuery(row.trip, query) && withinRange(row.trip, range),
+    );
+    return [...filtered].sort((a, b) => compareRows(a, b, sort));
+  }, [rows, query, range, sort]);
+
+  const isFiltered = Boolean(query.trim()) || range !== 'all';
+  const clearFilters = () => {
+    setQuery('');
+    setRange('all');
+  };
+
+  const summary = [
+    {
+      label: 'Total',
+      value: counts.total,
+      icon: <ListChecks className="h-3.5 w-3.5" />,
+      tone: 'text-slate-900',
+    },
+    {
+      label: 'Planned',
+      value: counts.planned,
+      icon: <CheckCircle2 className="h-3.5 w-3.5" />,
+      tone: 'text-green-700',
+    },
+    {
+      label: 'Failed',
+      value: counts.failed,
+      icon: <TriangleAlert className="h-3.5 w-3.5" />,
+      tone: 'text-red-700',
+    },
+    {
+      label: 'Pending',
+      value: counts.pending,
+      icon: <Clock className="h-3.5 w-3.5" />,
+      tone: 'text-amber-700',
+    },
+  ];
 
   return (
     <div className="space-y-6">
@@ -77,13 +141,37 @@ export function HistoryPage() {
         </a>
       </div>
 
+      {/* Summary row — counts the loaded set */}
+      {!loading && !error && (
+        <section aria-label="History summary">
+          <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
+            {summary.map((item) => (
+              <div
+                key={item.label}
+                className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm"
+              >
+                <dt className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
+                  <span aria-hidden="true" className="text-slate-400">
+                    {item.icon}
+                  </span>
+                  {item.label}
+                </dt>
+                <dd className={`mt-1.5 text-2xl font-semibold tabular-nums ${item.tone}`}>
+                  {item.value}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        </section>
+      )}
+
       {/* Controls */}
       <Card ariaLabel="Search and filters">
         <div className="space-y-4">
           <SearchInput
             id="trip-search"
-            label="Search trips by ID, origin, pickup or delivery"
-            placeholder="Search by trip ID, origin, pickup or delivery…"
+            label="Search trips by ID, location or status"
+            placeholder="Search trip ID, origin, pickup, delivery or status…"
             value={query}
             onChange={setQuery}
           />
@@ -95,31 +183,14 @@ export function HistoryPage() {
               onChange={setStatus}
             />
             <FilterTabs
-              legend="Sort order"
-              options={SORT_OPTIONS}
-              value={sort}
-              onChange={setSort}
+              legend="Date range"
+              options={RANGE_OPTIONS}
+              value={range}
+              onChange={setRange}
             />
-            <div className="flex flex-col gap-1.5">
-              <label htmlFor="from-date" className="text-xs font-medium text-slate-600">
-                Created on or after
-              </label>
-              <input
-                id="from-date"
-                type="date"
-                value={fromDate}
-                onChange={(event) => setFromDate(event.target.value)}
-                className="min-h-9 rounded-lg border border-gray-200 bg-white px-3 text-sm text-slate-900 hover:border-slate-300"
-              />
-            </div>
+            <FilterTabs legend="Sort by" options={SORT_OPTIONS} value={sort} onChange={setSort} />
             {isFiltered && (
-              <Button
-                variant="ghost"
-                onClick={() => {
-                  setQuery('');
-                  setFromDate('');
-                }}
-              >
+              <Button variant="ghost" onClick={clearFilters}>
                 Clear filters
               </Button>
             )}
@@ -127,22 +198,12 @@ export function HistoryPage() {
         </div>
       </Card>
 
-      {/* Results */}
-      {loading && (
-        <Card ariaLabel="Loading trips">
-          <div className="flex items-center justify-center gap-3 py-12 text-slate-500">
-            <span className="text-blue-600">
-              <Spinner label="Loading trips" />
-            </span>
-            <span className="text-sm">Loading trips…</span>
-          </div>
-        </Card>
-      )}
+      {loading && <HistorySkeleton />}
 
       {!loading && error && (
-        <Card ariaLabel="Error">
+        <Card ariaLabel="History unavailable">
           <EmptyState
-            icon={<HistoryIcon className="h-5 w-5" />}
+            illustration="trips"
             title="Could not load history"
             description={
               error.statusCode === 0
@@ -158,47 +219,57 @@ export function HistoryPage() {
           <p aria-live="polite" className="px-1 text-sm text-slate-600">
             Showing <strong className="font-semibold text-slate-900">{visible.length}</strong> of{' '}
             {rows.length} loaded
-            {status === 'all' && total > rows.length ? ` (${total} total)` : ''}
+            {status === 'all' && total > rows.length ? ` · ${total} total on server` : ''}
           </p>
 
-          {visible.length === 0 && rows.length === 0 && (
+          {/* No trips at all for this status */}
+          {rows.length === 0 && (
             <Card ariaLabel="No trips">
-              <EmptyState
-                icon={<HistoryIcon className="h-5 w-5" />}
-                title="No trips yet"
-                description={
-                  status === 'all'
-                    ? 'Once you plan a trip it will appear here with its route and schedule.'
-                    : `No trips with status “${status}”. Try a different filter.`
-                }
-                action={
-                  status === 'all' ? (
+              {status === 'all' ? (
+                <EmptyState
+                  illustration="trips"
+                  title="No trips yet"
+                  description="Once you plan a trip it will appear here with its route, schedule and legal status."
+                  action={
                     <a href={hrefFor('planner')}>
                       <Button>
                         <Plus aria-hidden="true" className="h-4 w-4" />
                         Plan a trip
                       </Button>
                     </a>
-                  ) : undefined
-                }
-              />
+                  }
+                />
+              ) : (
+                <EmptyState
+                  {...NO_MATCH_FOR_STATUS[status]}
+                  action={
+                    <Button variant="secondary" onClick={() => setStatus('all')}>
+                      Show all trips
+                    </Button>
+                  }
+                  secondaryAction={
+                    <a href={hrefFor('planner')}>
+                      <Button variant="ghost">Plan a trip</Button>
+                    </a>
+                  }
+                />
+              )}
             </Card>
           )}
 
-          {visible.length === 0 && rows.length > 0 && (
+          {/* Trips exist, but filters exclude them all */}
+          {rows.length > 0 && visible.length === 0 && (
             <Card ariaLabel="No search results">
               <EmptyState
-                icon={<SearchX className="h-5 w-5" />}
+                illustration="search"
                 title="No matching trips"
-                description="No trip matches your search and filters. Try a shorter search term or clear the date filter."
+                description={
+                  query.trim()
+                    ? `Nothing matches “${query.trim()}” in the selected date range. Try a shorter term or widen the range.`
+                    : 'No trip was created in the selected date range. Try a wider range.'
+                }
                 action={
-                  <Button
-                    variant="secondary"
-                    onClick={() => {
-                      setQuery('');
-                      setFromDate('');
-                    }}
-                  >
+                  <Button variant="secondary" onClick={clearFilters}>
                     Clear filters
                   </Button>
                 }

@@ -22,7 +22,6 @@
 import { useEffect, useMemo, useRef } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
-import { MapIcon } from 'lucide-react';
 import { decodePolyline } from '../lib/polyline';
 import type { LatLngTuple } from '../lib/polyline';
 import { MAP_COLORS } from '../lib/statusStyles';
@@ -242,7 +241,7 @@ export function RouteMap({
 export function RouteMapEmpty() {
   return (
     <EmptyState
-      icon={<MapIcon className="h-5 w-5" />}
+      illustration="route"
       title="No route available"
       description="Plan a trip to see the deadhead and loaded legs drawn on the map."
     />

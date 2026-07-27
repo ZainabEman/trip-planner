@@ -10,7 +10,7 @@
  * logs itself.
  */
 import { Fragment } from 'react';
-import { CalendarDays, ListOrdered, MapPin } from 'lucide-react';
+import { CalendarDays, MapPin } from 'lucide-react';
 import type { TimelineEvent } from '../types/api';
 import {
   crossesDateBoundary,
@@ -141,7 +141,7 @@ export function TimelineList({ events }: { events: TimelineEvent[] }) {
     return (
       <Card title="Timeline">
         <EmptyState
-          icon={<ListOrdered className="h-5 w-5" />}
+          illustration="timeline"
           title="No timeline available"
           description="Once a trip is planned, every driving period, break and stop appears here in order."
           compact

@@ -11,7 +11,7 @@
  * `tripMetrics.summaryFromStored`. That keeps SummaryCard reusable unchanged.
  */
 import { useEffect, useState } from 'react';
-import { ArrowLeft, ListOrdered, RefreshCw } from 'lucide-react';
+import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { hrefFor } from '../hooks/useHashRoute';
 import { ApiError, api } from '../lib/apiClient';
 import { summaryFromStored } from '../lib/tripMetrics';
@@ -21,10 +21,11 @@ import { SummaryCard } from '../components/SummaryCard';
 import { TimelineList } from '../components/TimelineList';
 import { TripMetaGrid } from '../components/TripMetaGrid';
 import { TripStatusBar } from '../components/TripStatusBar';
+import { SummarySkeleton, TimelineSkeleton } from '../components/Skeletons';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { EmptyState } from '../components/ui/EmptyState';
-import { Spinner } from '../components/ui/Spinner';
+import { Skeleton } from '../components/ui/Skeleton';
 
 interface Loaded {
   trip: Trip;
@@ -82,14 +83,14 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
     return (
       <div className="space-y-6">
         {backLink}
-        <Card ariaLabel="Loading trip">
-          <div className="flex items-center justify-center gap-3 py-16 text-slate-500">
-            <span className="text-blue-600">
-              <Spinner label="Loading trip" />
-            </span>
-            <span className="text-sm">Loading trip…</span>
-          </div>
-        </Card>
+        {/* Shape-matched placeholders, so the page does not jump when data lands. */}
+        <SummarySkeleton />
+        <div className="grid items-start gap-6 lg:grid-cols-2">
+          <TimelineSkeleton />
+          <Card title="Route">
+            <Skeleton className="h-[320px] w-full sm:h-[420px]" />
+          </Card>
+        </div>
       </div>
     );
   }
@@ -101,7 +102,7 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
         {backLink}
         <Card ariaLabel="Trip not available">
           <EmptyState
-            icon={<ListOrdered className="h-5 w-5" />}
+            illustration="route"
             title={notFound ? 'Trip not found' : 'Could not load this trip'}
             description={
               notFound
