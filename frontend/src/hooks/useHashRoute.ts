@@ -11,7 +11,7 @@
  * second parameterised route ever appears, this is the moment to reach for a
  * real router instead of growing this.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 
 export const ROUTES = {
   dashboard: '/',
@@ -61,19 +61,38 @@ function parse(hash: string): Route {
   return { key: 'dashboard' };
 }
 
+/**
+ * Scroll offset per path, so going back to a long list returns you to where you
+ * were rather than to the top. Module-level: it must outlive re-renders but not
+ * the page, and it is never read across sessions.
+ */
+const scrollOffsets = new Map<string, number>();
+
+function currentPath(): string {
+  return window.location.hash.replace(/^#/, '') || ROUTES.dashboard;
+}
+
 export function useHashRoute() {
   const [route, setRoute] = useState<Route>(() => parse(window.location.hash));
+  const previousPath = useRef(currentPath());
 
   useEffect(() => {
-    const onChange = () => setRoute(parse(window.location.hash));
+    const onChange = () => {
+      // Record where we were before the path changes, then move.
+      scrollOffsets.set(previousPath.current, window.scrollY);
+      previousPath.current = currentPath();
+      setRoute(parse(window.location.hash));
+    };
     window.addEventListener('hashchange', onChange);
     return () => window.removeEventListener('hashchange', onChange);
   }, []);
 
-  // Scroll to the top on navigation, so a long page does not leave the next one
-  // mid-scroll. Keyed on the resolved path, not the object, to avoid re-firing.
-  useEffect(() => {
-    window.scrollTo({ top: 0 });
+  // Restore the remembered offset for this path, or start at the top on a page
+  // seen for the first time. Runs in a layout effect so the jump happens before
+  // paint rather than as a visible lurch.
+  useLayoutEffect(() => {
+    const saved = scrollOffsets.get(currentPath());
+    window.scrollTo({ top: saved ?? 0 });
   }, [route.key, route.tripId]);
 
   return { route };

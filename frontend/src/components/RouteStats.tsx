@@ -8,7 +8,7 @@
  */
 import { Flag, Fuel, MapPin, Route as RouteIcon, Truck } from 'lucide-react';
 import type { RouteLeg, TimelineEvent } from '../types/api';
-import { formatDateTime, formatDecimal } from '../lib/format';
+import { formatDateTime, formatMiles } from '../lib/format';
 import { arrivalTime } from '../lib/tripMetrics';
 
 interface RouteStatsProps {
@@ -34,19 +34,19 @@ export function RouteStats({ route, timeline }: RouteStatsProps) {
     {
       icon: <Truck className="h-3.5 w-3.5" />,
       label: 'Deadhead',
-      value: `${formatDecimal(deadhead.toFixed(2))} mi`,
+      value: formatMiles(deadhead),
       hint: 'Current location → pickup, unloaded',
     },
     {
       icon: <Fuel className="h-3.5 w-3.5" />,
       label: 'Loaded',
-      value: `${formatDecimal(loaded.toFixed(2))} mi`,
+      value: formatMiles(loaded),
       hint: 'Pickup → delivery, under load',
     },
     {
       icon: <RouteIcon className="h-3.5 w-3.5" />,
       label: 'Total',
-      value: `${formatDecimal(total.toFixed(2))} mi`,
+      value: formatMiles(total),
       hint: 'Both legs combined',
     },
     {

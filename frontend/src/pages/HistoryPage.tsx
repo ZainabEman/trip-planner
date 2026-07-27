@@ -18,6 +18,7 @@ import type { DateRange, SortKey } from '../lib/tripMetrics';
 import { computeKpis } from '../lib/tripStats';
 import type { TripStatus } from '../types/api';
 import { HistorySkeleton } from '../components/Skeletons';
+import { KpiCard } from '../components/KpiCard';
 import { TripCard } from '../components/TripCard';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -99,33 +100,6 @@ export function HistoryPage() {
     setRange('all');
   };
 
-  const summary = [
-    {
-      label: 'Total',
-      value: counts.total,
-      icon: <ListChecks className="h-3.5 w-3.5" />,
-      tone: 'text-slate-900',
-    },
-    {
-      label: 'Planned',
-      value: counts.planned,
-      icon: <CheckCircle2 className="h-3.5 w-3.5" />,
-      tone: 'text-green-700',
-    },
-    {
-      label: 'Failed',
-      value: counts.failed,
-      icon: <TriangleAlert className="h-3.5 w-3.5" />,
-      tone: 'text-red-700',
-    },
-    {
-      label: 'Pending',
-      value: counts.pending,
-      icon: <Clock className="h-3.5 w-3.5" />,
-      tone: 'text-amber-700',
-    },
-  ];
-
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -141,26 +115,29 @@ export function HistoryPage() {
         </a>
       </div>
 
-      {/* Summary row — counts the loaded set */}
+      {/* Summary row — counts the loaded set, so it always agrees with the list */}
       {!loading && !error && (
         <section aria-label="History summary">
           <dl className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-            {summary.map((item) => (
-              <div
-                key={item.label}
-                className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm"
-              >
-                <dt className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-slate-500">
-                  <span aria-hidden="true" className="text-slate-400">
-                    {item.icon}
-                  </span>
-                  {item.label}
-                </dt>
-                <dd className={`mt-1.5 text-2xl font-semibold tabular-nums ${item.tone}`}>
-                  {item.value}
-                </dd>
-              </div>
-            ))}
+            <KpiCard label="Total" value={counts.total} icon={<ListChecks className="h-4 w-4" />} />
+            <KpiCard
+              label="Planned"
+              value={counts.planned}
+              tone="success"
+              icon={<CheckCircle2 className="h-4 w-4" />}
+            />
+            <KpiCard
+              label="Failed"
+              value={counts.failed}
+              tone={counts.failed > 0 ? 'danger' : 'neutral'}
+              icon={<TriangleAlert className="h-4 w-4" />}
+            />
+            <KpiCard
+              label="Pending"
+              value={counts.pending}
+              tone={counts.pending > 0 ? 'warning' : 'neutral'}
+              icon={<Clock className="h-4 w-4" />}
+            />
           </dl>
         </section>
       )}

@@ -34,6 +34,7 @@ import { computeAnalytics, computeKpis } from '../lib/tripStats';
 import { DashboardSkeleton } from '../components/Skeletons';
 import { KpiCard } from '../components/KpiCard';
 import { OperationsActivityFeed } from '../components/OperationsActivityFeed';
+import { ReferenceLinks } from '../components/ReferenceLinks';
 import { TripCard } from '../components/TripCard';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
@@ -119,6 +120,8 @@ export function DashboardPage() {
           />
         </Card>
       )}
+
+      {!loading && !error && kpis.total === 0 && <ReferenceLinks />}
 
       {!loading && !error && kpis.total > 0 && (
         <>
@@ -303,62 +306,8 @@ export function DashboardPage() {
             </Card>
           </div>
 
-          {/* Reference links */}
-          <div className="grid gap-4 sm:grid-cols-3">
-            {[
-              {
-                key: 'hos' as const,
-                title: 'Hours of Service',
-                body: 'The five federal limits, in plain terms',
-              },
-              { key: 'faq' as const, title: 'FAQ', body: 'How planning works and why trips fail' },
-              {
-                key: 'support' as const,
-                title: 'Support',
-                body: 'Troubleshooting and how to report an issue',
-              },
-            ].map((item) => (
-              <a
-                key={item.key}
-                href={hrefFor(item.key)}
-                className="group flex items-start justify-between gap-3 rounded-xl border border-gray-200 bg-white p-4 shadow-sm transition-colors hover:border-blue-300"
-              >
-                <span className="min-w-0">
-                  <span className="block text-sm font-semibold text-slate-900">{item.title}</span>
-                  <span className="mt-0.5 block text-xs leading-relaxed text-slate-500">
-                    {item.body}
-                  </span>
-                </span>
-                <ArrowRight
-                  aria-hidden="true"
-                  className="mt-0.5 h-4 w-4 shrink-0 text-slate-400 transition-transform group-hover:translate-x-0.5"
-                />
-              </a>
-            ))}
-          </div>
+          <ReferenceLinks />
         </>
-      )}
-
-      {!loading && !error && kpis.total === 0 && (
-        <div className="grid gap-4 sm:grid-cols-3">
-          {[
-            { key: 'hos' as const, title: 'Hours of Service', body: 'The five federal limits' },
-            { key: 'faq' as const, title: 'FAQ', body: 'How planning works' },
-            { key: 'support' as const, title: 'Support', body: 'Troubleshooting' },
-          ].map((item) => (
-            <a
-              key={item.key}
-              href={hrefFor(item.key)}
-              className="group flex items-start justify-between gap-3 rounded-xl border border-gray-200 bg-white p-4 shadow-sm transition-colors hover:border-blue-300"
-            >
-              <span className="min-w-0">
-                <span className="block text-sm font-semibold text-slate-900">{item.title}</span>
-                <span className="mt-0.5 block text-xs text-slate-500">{item.body}</span>
-              </span>
-              <ArrowRight aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0 text-slate-400" />
-            </a>
-          ))}
-        </div>
       )}
 
       <p className="px-1 text-xs text-slate-500">

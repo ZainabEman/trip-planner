@@ -19,7 +19,7 @@ import {
   Timer,
 } from 'lucide-react';
 import type { Trip, TripStatus } from '../types/api';
-import { formatDateTime, formatDecimal, formatDuration } from '../lib/format';
+import { formatDateTime, formatDuration, formatMiles } from '../lib/format';
 import { legalityLabel } from '../lib/tripMetrics';
 import { tripStatusLabel, tripStatusTone } from '../lib/statusStyles';
 import { tripHref } from '../hooks/useHashRoute';
@@ -51,7 +51,7 @@ export function TripCard({ trip, arrival }: TripCardProps) {
     {
       icon: <Gauge className={METRIC_ICON} />,
       label: 'Distance',
-      value: trip.total_distance_miles ? `${formatDecimal(trip.total_distance_miles)} mi` : '—',
+      value: formatMiles(trip.total_distance_miles),
     },
     {
       icon: <Timer className={METRIC_ICON} />,

@@ -104,6 +104,24 @@ export function formatDecimal(value: string | null | undefined, fractionDigits =
   });
 }
 
+/**
+ * Render a mileage with its unit, at a fixed one decimal place.
+ *
+ * Every mileage in the app goes through here. `formatDecimal` alone gave
+ * inconsistent precision — 35.91 rendered as "35.9" but 238.95 rounded to "239"
+ * — which looked like sloppy data rather than rounding. Fixing the scale first
+ * keeps a column of distances aligned.
+ */
+export function formatMiles(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '—';
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) return '—';
+  return `${parsed.toLocaleString('en-US', {
+    minimumFractionDigits: 1,
+    maximumFractionDigits: 1,
+  })} mi`;
+}
+
 /** Whether two ISO timestamps fall on different UTC calendar days. */
 export function crossesDateBoundary(previousIso: string, currentIso: string): boolean {
   return formatDate(previousIso) !== formatDate(currentIso);

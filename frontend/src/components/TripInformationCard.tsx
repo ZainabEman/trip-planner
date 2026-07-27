@@ -9,7 +9,7 @@
  * the order someone reads a report in, not the order the API returns fields.
  */
 import type { ReactNode } from 'react';
-import { formatDateTime, formatDecimal, formatDuration } from '../lib/format';
+import { formatDateTime, formatDecimal, formatDuration, formatMiles } from '../lib/format';
 import { arrivalTime, summaryFromStored } from '../lib/tripMetrics';
 import { tripStatusLabel, tripStatusTone } from '../lib/statusStyles';
 import { legalityLabel } from '../lib/tripMetrics';
@@ -124,9 +124,7 @@ export function TripInformationCard({ trip, timeline, route }: TripInformationCa
           fields={[
             {
               label: 'Distance',
-              value: trip.total_distance_miles
-                ? `${formatDecimal(trip.total_distance_miles)} mi`
-                : '—',
+              value: formatMiles(trip.total_distance_miles),
             },
             {
               label: 'Driving hours',
