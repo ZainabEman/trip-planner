@@ -70,17 +70,36 @@ function markerIcon(label: string, color: string): L.DivIcon {
   });
 }
 
+/**
+ * Popup body.
+ *
+ * Built as an HTML string because Leaflet owns the popup's DOM — a React
+ * component cannot be mounted into it without a second root. Every interpolated
+ * value is escaped: `location_name` is user-entered text that reached us via the
+ * geocoder, so it must never be trusted as markup.
+ */
 function popupHtml(stop: Stop): string {
-  const escape = (value: string) => value.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+  const escape = (value: string) => value.replace(/[&<>"']/g, (ch) => `&#${ch.charCodeAt(0)};`);
+  const [lat, lng] = stop.position;
+
   return `
-    <div style="min-width:150px">
-      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
-        <span style="width:8px;height:8px;border-radius:9999px;background:${stop.color}"></span>
-        <span style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#64748b">
+    <div style="min-width:180px;font-family:Inter,system-ui,sans-serif">
+      <div style="display:flex;align-items:center;gap:6px">
+        <span style="width:18px;height:18px;border-radius:9999px;background:${stop.color};
+                     color:#fff;font:600 10px/18px Inter,sans-serif;text-align:center">
+          ${escape(stop.label)}
+        </span>
+        <span style="font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase;color:#64748b">
           ${escape(stop.role)}
         </span>
       </div>
-      <div style="font-weight:600;color:#0f172a">${escape(stop.name)}</div>
+      <div style="margin-top:6px;font-weight:600;font-size:13px;color:#0f172a">
+        ${escape(stop.name)}
+      </div>
+      <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;
+                  font:400 11px/1.4 ui-monospace,monospace;color:#64748b">
+        ${lat.toFixed(5)}, ${lng.toFixed(5)}
+      </div>
     </div>`;
 }
 

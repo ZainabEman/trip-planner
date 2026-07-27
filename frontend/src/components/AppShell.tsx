@@ -8,6 +8,7 @@ import type { ReactNode } from 'react';
 import { Truck } from 'lucide-react';
 import { ROUTES, hrefFor } from '../hooks/useHashRoute';
 import type { RouteKey } from '../hooks/useHashRoute';
+import { APP_CONTEXT, APP_NAME, BUILT_BY, REGULATION, TECH_STACK } from '../lib/appInfo';
 
 type NavKey = keyof typeof ROUTES;
 
@@ -35,7 +36,7 @@ export function AppShell({ route, children }: AppShellProps) {
         Skip to main content
       </a>
 
-      <header className="sticky top-0 z-30 border-b border-gray-200 bg-white">
+      <header className="no-print sticky top-0 z-30 border-b border-gray-200 bg-white">
         <div className="mx-auto max-w-7xl px-4 sm:px-6">
           <div className="flex h-16 items-center justify-between gap-4">
             <a
@@ -88,10 +89,46 @@ export function AppShell({ route, children }: AppShellProps) {
         {children}
       </main>
 
-      <footer className="border-t border-gray-200 bg-white">
-        <div className="mx-auto max-w-7xl px-4 py-5 sm:px-6">
-          <p className="text-xs leading-relaxed text-slate-500">
-            Planning projections based on 49 CFR Part 395. This tool is a planning aid, not an
+      <footer className="no-print border-t border-gray-200 bg-white">
+        <div className="mx-auto max-w-7xl px-4 py-8 sm:px-6">
+          <div className="flex flex-wrap items-start justify-between gap-x-8 gap-y-6">
+            <div className="min-w-0">
+              <p className="flex flex-wrap items-center gap-x-2 text-sm font-semibold text-slate-900">
+                <Truck aria-hidden="true" className="h-4 w-4 text-blue-600" />
+                {APP_NAME}
+                <span aria-hidden="true" className="text-slate-300">
+                  ·
+                </span>
+                <span className="font-medium text-slate-600">{APP_CONTEXT}</span>
+              </p>
+              <p className="mt-1.5 text-xs text-slate-500">
+                Built by <span className="font-medium text-slate-700">{BUILT_BY}</span>
+              </p>
+            </div>
+
+            <div className="min-w-0">
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Powered by
+              </p>
+              <ul className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
+                {TECH_STACK.map((tech) => (
+                  <li key={tech.label}>
+                    <a
+                      href={tech.href}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="inline-flex min-h-8 items-center rounded-md border border-gray-200 px-2 text-xs font-medium text-slate-600 transition-colors hover:border-blue-300 hover:text-blue-700"
+                    >
+                      {tech.label}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+          <p className="mt-6 border-t border-gray-100 pt-4 text-xs leading-relaxed text-slate-500">
+            Planning projections based on {REGULATION}. This tool is a planning aid, not an
             Electronic Logging Device, and its output is not an official record of duty status.
             Always verify against your ELD and carrier policy.
           </p>

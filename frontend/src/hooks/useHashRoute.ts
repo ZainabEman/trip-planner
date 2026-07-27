@@ -11,7 +11,7 @@
  * second parameterised route ever appears, this is the moment to reach for a
  * real router instead of growing this.
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 export const ROUTES = {
   dashboard: '/',
@@ -36,7 +36,7 @@ const PATH_TO_KEY = Object.fromEntries(
 ) as Record<string, RouteKey>;
 
 /** Path builders — the single source for every in-app link target. */
-export const paths = {
+const paths = {
   ...ROUTES,
   trip: (id: string) => `/trips/${id}`,
 } as const;
@@ -76,9 +76,5 @@ export function useHashRoute() {
     window.scrollTo({ top: 0 });
   }, [route.key, route.tripId]);
 
-  const navigate = useCallback((path: string) => {
-    window.location.hash = path;
-  }, []);
-
-  return { route, navigate };
+  return { route };
 }

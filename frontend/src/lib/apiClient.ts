@@ -129,5 +129,3 @@ export const api = {
     return request<RouteLeg[]>(`/trips/${tripId}/route/`);
   },
 };
-
-export { API_BASE_URL };

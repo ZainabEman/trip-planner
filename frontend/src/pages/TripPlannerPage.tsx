@@ -22,7 +22,7 @@ import { RoutePanel } from '../components/RoutePanel';
 import { SummaryCard } from '../components/SummaryCard';
 import { TimelineList } from '../components/TimelineList';
 import { TripForm } from '../components/TripForm';
-import { TripMetaGrid } from '../components/TripMetaGrid';
+import { TripInformationCard } from '../components/TripInformationCard';
 import { TripStatusBar } from '../components/TripStatusBar';
 import { Card } from '../components/ui/Card';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -86,7 +86,7 @@ export function TripPlannerPage() {
       {/* 6 — Trip record, with a permanent link to this trip */}
       {showResults && plan && (
         <>
-          <TripMetaGrid trip={plan.trip} timeline={plan.timeline} route={plan.route} />
+          <TripInformationCard trip={plan.trip} timeline={plan.timeline} route={plan.route} />
           <p className="px-1">
             <a
               href={tripHref(plan.trip.id)}

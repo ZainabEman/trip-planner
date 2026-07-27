@@ -16,6 +16,7 @@ import { Badge } from './ui/Badge';
 import { Card } from './ui/Card';
 import { StatTile } from './ui/StatTile';
 import { tripStatusLabel, tripStatusTone } from '../lib/statusStyles';
+import { legalityLabel } from '../lib/tripMetrics';
 
 interface SummaryCardProps {
   summary: PlanSummary;
@@ -32,8 +33,15 @@ export function SummaryCard({ summary, planningStatus }: SummaryCardProps) {
       title="Trip summary"
       action={
         <div className="flex items-center gap-2">
-          <Badge tone={isLegal ? 'success' : 'danger'} size="md" dot>
-            {isLegal ? 'Legal' : 'Not legal'}
+          {/* Wording comes from tripMetrics so every legality badge in the app
+              says the same thing — notably "Not planned" rather than
+              "Not legal" for a trip that simply has not run yet. */}
+          <Badge
+            tone={isLegal ? 'success' : planningStatus === 'failed' ? 'danger' : 'neutral'}
+            size="md"
+            dot
+          >
+            {legalityLabel(planningStatus)}
           </Badge>
           <Badge tone={tripStatusTone(planningStatus)} size="md">
             {tripStatusLabel(planningStatus)}

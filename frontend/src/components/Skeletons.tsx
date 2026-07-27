@@ -38,24 +38,6 @@ export function TripCardSkeleton() {
   );
 }
 
-export function TripListSkeleton({
-  rows = 4,
-  label = 'Loading trips',
-}: {
-  rows?: number;
-  label?: string;
-}) {
-  return (
-    <SkeletonRegion label={label}>
-      <ul className="space-y-3">
-        {Array.from({ length: rows }, (_, i) => (
-          <TripCardSkeleton key={i} />
-        ))}
-      </ul>
-    </SkeletonRegion>
-  );
-}
-
 /** Mirrors the KPI row + analytics grid + activity feed. */
 export function DashboardSkeleton() {
   return (

@@ -111,3 +111,58 @@ export function buildPlanSteps(
 export function stepsComplete(steps: PlanStep[]): boolean {
   return steps.every((step) => step.state === 'complete');
 }
+
+/**
+ * Reconstruct the activity log for a **stored** trip.
+ *
+ * The live version above reads the in-flight request's phase; this one infers
+ * the same four stages from what was persisted, so the details page can show
+ * planner activity for a trip planned days ago:
+ *
+ *  - creation always succeeded, or the row would not exist;
+ *  - routing succeeded if route legs were stored;
+ *  - the rule check and timeline succeeded if the trip is `planned` with events.
+ *
+ * A `failed` trip is attributed to the rule check, because that is the only
+ * stage that sets `failed` — a routing failure raises before the status is
+ * touched and leaves the trip `pending`, which is reported as routing not
+ * having completed. The blocking rule id is not on the Trip row, so a
+ * historical failure cannot name its rule here.
+ */
+export function stepsFromStoredTrip(
+  trip: { status: string; total_distance_miles: string | null },
+  timelineCount: number,
+  routeLegCount: number,
+): PlanStep[] {
+  const routed = routeLegCount > 0 || trip.total_distance_miles !== null;
+  const planned = trip.status === 'planned' && timelineCount > 0;
+  const failed = trip.status === 'failed';
+
+  const routeState: StepState = routed ? 'complete' : 'pending';
+  const rulesState: StepState = planned ? 'complete' : failed ? 'failed' : 'pending';
+  const timelineState: StepState = planned ? 'complete' : 'pending';
+
+  return [
+    { id: 'create', label: LABELS.create, state: 'complete', detail: 'Saved' },
+    {
+      id: 'route',
+      label: LABELS.route,
+      state: routeState,
+      detail: routed
+        ? `${routeLegCount} legs · ${trip.total_distance_miles ?? '—'} mi`
+        : 'No route stored',
+    },
+    {
+      id: 'rules',
+      label: LABELS.rules,
+      state: rulesState,
+      detail: planned ? 'No violations' : failed ? 'Rejected — no legal schedule' : 'Not evaluated',
+    },
+    {
+      id: 'timeline',
+      label: LABELS.timeline,
+      state: timelineState,
+      detail: planned ? `${timelineCount} events` : 'No timeline stored',
+    },
+  ];
+}

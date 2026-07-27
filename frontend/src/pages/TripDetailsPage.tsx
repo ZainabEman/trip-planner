@@ -1,27 +1,37 @@
 /**
- * A single trip, loaded from stored data.
+ * A single trip, as a dispatch report.
  *
- * Composed entirely from the components the planner uses — TripStatusBar,
- * SummaryCard, TimelineList, RoutePanel, TripMetaGrid — so a trip looks the same
- * whether you have just planned it or opened it a week later.
+ * Six sections in reading order: status, summary, route, timeline, trip
+ * information, planner activity. Everything is composed from the components the
+ * planner uses, so a trip looks the same whether you just planned it or opened
+ * it a week later.
  *
- * The one wrinkle: `GET /trips/{id}/` returns no `summary` block (the API
- * computes that per planning run and stores no columns for it), so the summary
- * is reconstructed from the persisted trip + timeline by
- * `tripMetrics.summaryFromStored`. That keeps SummaryCard reusable unchanged.
+ * Two wrinkles, both from the API shape rather than choice:
+ *  - `GET /trips/{id}/` returns no `summary` block, so it is reconstructed from
+ *    the persisted trip + timeline by `tripMetrics.summaryFromStored`;
+ *  - planner activity for a stored trip is inferred by
+ *    `planSteps.stepsFromStoredTrip`, since the live phase is long gone.
+ *
+ * The page is print-ready: chrome carries `no-print`, and a print-only header
+ * supplies the title a printed report needs once the nav is gone.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, RefreshCw } from 'lucide-react';
 import { hrefFor } from '../hooks/useHashRoute';
 import { ApiError, api } from '../lib/apiClient';
+import { APP_CONTEXT, APP_NAME, REGULATION } from '../lib/appInfo';
+import { formatDateTime } from '../lib/format';
+import { stepsFromStoredTrip } from '../lib/planSteps';
 import { summaryFromStored } from '../lib/tripMetrics';
 import type { RouteLeg, TimelineEvent, Trip } from '../types/api';
+import { PlanningActivityLog } from '../components/PlanningActivityLog';
 import { RoutePanel } from '../components/RoutePanel';
 import { SummaryCard } from '../components/SummaryCard';
-import { TimelineList } from '../components/TimelineList';
-import { TripMetaGrid } from '../components/TripMetaGrid';
-import { TripStatusBar } from '../components/TripStatusBar';
 import { SummarySkeleton, TimelineSkeleton } from '../components/Skeletons';
+import { TimelineList } from '../components/TimelineList';
+import { TripActions } from '../components/TripActions';
+import { TripInformationCard } from '../components/TripInformationCard';
+import { TripStatusBar } from '../components/TripStatusBar';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -37,7 +47,7 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
   const [data, setData] = useState<Loaded | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [loading, setLoading] = useState(true);
-  const [token, setToken] = useState(0);
+  const [reloadToken, setReloadToken] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -67,12 +77,17 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
     return () => {
       cancelled = true;
     };
-  }, [tripId, token]);
+  }, [tripId, reloadToken]);
+
+  const activitySteps = useMemo(
+    () => (data ? stepsFromStoredTrip(data.trip, data.timeline.length, data.route.length) : []),
+    [data],
+  );
 
   const backLink = (
     <a
       href={hrefFor('history')}
-      className="inline-flex min-h-11 items-center gap-1.5 text-sm font-medium text-blue-700 hover:text-blue-800"
+      className="no-print inline-flex min-h-11 items-center gap-1.5 text-sm font-medium text-blue-700 hover:text-blue-800"
     >
       <ArrowLeft aria-hidden="true" className="h-4 w-4" />
       Back to history
@@ -83,7 +98,6 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
     return (
       <div className="space-y-6">
         {backLink}
-        {/* Shape-matched placeholders, so the page does not jump when data lands. */}
         <SummarySkeleton />
         <div className="grid items-start gap-6 lg:grid-cols-2">
           <TimelineSkeleton />
@@ -112,8 +126,12 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
                   : (error?.message ?? 'Something went wrong.')
             }
             action={
-              notFound ? undefined : (
-                <Button variant="secondary" onClick={() => setToken((n) => n + 1)}>
+              notFound ? (
+                <a href={hrefFor('history')}>
+                  <Button variant="secondary">Back to history</Button>
+                </a>
+              ) : (
+                <Button variant="secondary" onClick={() => setReloadToken((n) => n + 1)}>
                   <RefreshCw aria-hidden="true" className="h-4 w-4" />
                   Try again
                 </Button>
@@ -127,34 +145,46 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
 
   const { trip, timeline, route } = data;
   const planned = trip.status === 'planned' && timeline.length > 0;
+  const summary = summaryFromStored(trip, timeline);
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-wrap items-center justify-between gap-3">
+      {/* Screen-only chrome */}
+      <div className="no-print flex flex-wrap items-center justify-between gap-3">
         {backLink}
-        <a href={hrefFor('planner')} className="shrink-0">
+        <a href={hrefFor('planner')}>
           <Button variant="secondary">Plan a new trip</Button>
         </a>
       </div>
 
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-          {trip.current_location_text} → {trip.pickup_location_text} → {trip.dropoff_location_text}
-        </h1>
-        <p className="mt-1 font-mono text-xs text-slate-500">{trip.id}</p>
+      {/* Print-only masthead — replaces the hidden nav on paper. */}
+      <div className="print-only mb-4 border-b border-gray-300 pb-3">
+        <p className="text-base font-semibold">
+          {APP_NAME} — {APP_CONTEXT}
+        </p>
+        <p className="mt-0.5 text-xs">
+          Trip report · generated {formatDateTime(new Date().toISOString())} · projections based on{' '}
+          {REGULATION}. Not an official record of duty status.
+        </p>
       </div>
 
-      {/* Legal status */}
+      {/* Report heading */}
+      <header className="flex flex-wrap items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
+            {trip.current_location_text} → {trip.pickup_location_text} →{' '}
+            {trip.dropoff_location_text}
+          </h1>
+          <p className="mt-1 font-mono text-xs text-slate-500">{trip.id}</p>
+        </div>
+        <TripActions trip={trip} timeline={timeline} route={route} />
+      </header>
+
+      {/* 1 — Trip status */}
       {planned ? (
         <TripStatusBar
           kind="legal"
-          plan={{
-            planning_status: trip.status,
-            trip,
-            route,
-            timeline,
-            summary: summaryFromStored(trip, timeline),
-          }}
+          plan={{ planning_status: trip.status, trip, route, timeline, summary }}
         />
       ) : (
         <TripStatusBar
@@ -167,19 +197,20 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
         />
       )}
 
-      {/* Metrics */}
-      {planned && (
-        <SummaryCard summary={summaryFromStored(trip, timeline)} planningStatus={trip.status} />
-      )}
+      {/* 2 — Trip summary */}
+      {planned && <SummaryCard summary={summary} planningStatus={trip.status} />}
 
-      {/* Timeline beside the map */}
+      {/* 3 & 4 — Route beside the timeline on desktop */}
       <div className="grid items-start gap-6 lg:grid-cols-2">
         <TimelineList events={timeline} />
         <RoutePanel route={route} timeline={timeline} />
       </div>
 
-      {/* Metadata */}
-      <TripMetaGrid trip={trip} timeline={timeline} route={route} />
+      {/* 5 — Trip information */}
+      <TripInformationCard trip={trip} timeline={timeline} route={route} />
+
+      {/* 6 — Planner activity */}
+      <PlanningActivityLog steps={activitySteps} />
     </div>
   );
 }

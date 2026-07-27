@@ -66,6 +66,117 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
+ * Print — turn the trip details page into a dispatch report.
+ *
+ * Anything interactive is removed rather than merely faded: a printed page has
+ * no buttons, so a greyed-out toolbar is just noise. Collapsed `<details>` are
+ * forced open, because a printed timeline that hides its reasons is useless as
+ * a record.
+ *
+ * Mark chrome with `no-print`; mark print-only annotations with `print-only`.
+ * ------------------------------------------------------------------------- */
+
+.print-only {
+  display: none;
+}
+
+@media print {
+  @page {
+    margin: 14mm;
+  }
+
+  html,
+  body {
+    background: #fff;
+  }
+
+  body {
+    /* Print in black on white regardless of the screen palette. */
+    color: #000;
+    font-size: 10.5pt;
+  }
+
+  /* Chrome: navigation, actions, filters, footer, skip links. */
+  .no-print,
+  header,
+  footer,
+  nav,
+  button,
+  [role='status'] {
+    display: none !important;
+  }
+
+  .print-only {
+    display: block;
+  }
+
+  /* Cards flatten to hairline-ruled blocks and must not split mid-section. */
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+  }
+
+  section,
+  .print-block {
+    break-inside: avoid;
+    page-break-inside: avoid;
+    border-color: #999 !important;
+    box-shadow: none !important;
+  }
+
+  /* Expand every disclosure so the report carries the full reasoning. */
+  details {
+    display: block !important;
+  }
+
+  details > summary {
+    display: none !important;
+  }
+
+  details > div {
+    display: block !important;
+    padding-top: 0 !important;
+  }
+
+  /* Keep an individual timeline event together across a page break. */
+  li {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  /* Leaflet: give the map a fixed printable box and drop its controls. */
+  .leaflet-container {
+    height: 90mm !important;
+    border: 1px solid #999;
+  }
+
+  .leaflet-control-container,
+  .leaflet-control-zoom {
+    display: none !important;
+  }
+
+  /* Ask the browser to keep tile imagery and status colours. */
+  .leaflet-container,
+  .leaflet-tile-pane,
+  [data-print-color] {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  a {
+    text-decoration: none;
+    color: #000;
+  }
+
+  /* Expose link targets that would otherwise be lost on paper. */
+  a[href^='http']::after {
+    content: ' (' attr(href) ')';
+    font-size: 8pt;
+    color: #555;
+  }
+}
+
+/* ---------------------------------------------------------------------------
  * Leaflet overrides — the map's default chrome is dated, and its popup and
  * attribution styles are injected as plain CSS that Tailwind classes cannot
  * reach. Restyled here to match the surrounding cards.

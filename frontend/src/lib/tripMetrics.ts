@@ -24,11 +24,6 @@ export function arrivalTime(timeline: TimelineEvent[]): string | null {
   return timeline[timeline.length - 1].end_time;
 }
 
-/** Whether a trip has a compliant, stored plan. */
-export function isLegal(status: TripStatus): boolean {
-  return status === 'planned';
-}
-
 /**
  * Legality label for a badge.
  *
@@ -47,19 +42,6 @@ export function legalityLabel(status: TripStatus): string {
     default:
       return 'Not planned';
   }
-}
-
-/**
- * Driving hours for a trip, from the route's own duration.
- *
- * `Trip.total_duration_minutes` is what the routing provider reported for the
- * two legs, i.e. time behind the wheel. This is *not* the trip's elapsed
- * duration — that adds inspections, loading and rest, and is only derivable
- * once a timeline exists (see `elapsedHours`).
- */
-export function drivingHours(trip: Trip): number | null {
-  if (trip.total_duration_minutes === null) return null;
-  return trip.total_duration_minutes / 60;
 }
 
 /** Wall-clock span of a stored timeline, in hours. */
