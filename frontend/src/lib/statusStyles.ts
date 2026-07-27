@@ -34,6 +34,13 @@ export const MAP_COLORS = {
   delivery: '#16a34a',
   deadhead: '#94a3b8',
   loaded: '#2563eb',
+  // Stops the planner inserted. Distinct hues from the three route endpoints
+  // above, so a map of a multi-day trip separates "where the load goes" from
+  // "where the rules made the truck stop" at a glance.
+  break: '#f59e0b',
+  rest: '#6366f1',
+  restart: '#7c3aed',
+  fuel: '#0d9488',
 } as const;
 
 export function dutyStatusTone(status: DutyStatus): BadgeTone {

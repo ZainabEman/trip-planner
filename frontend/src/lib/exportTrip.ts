@@ -8,6 +8,7 @@
  */
 import type { RouteLeg, TimelineEvent, Trip } from '../types/api';
 import { durationMinutes } from './format';
+import { analysePlan, groupIntoDays } from './planAnalysis';
 import { arrivalTime, summaryFromStored } from './tripMetrics';
 
 export interface ExportInput {
@@ -33,6 +34,20 @@ export function buildTripJson({ trip, timeline, route }: ExportInput): string {
       source: 'Truck Trip Planner — planning projection, not an ELD record',
       trip,
       summary: summaryFromStored(trip, timeline),
+      // What the planner had to insert, and how the schedule breaks down by
+      // day. Derived rather than stored, but exporting it means a consumer of
+      // the file does not have to re-derive it — which is the whole point of an
+      // export.
+      composition: analysePlan(timeline),
+      days: groupIntoDays(timeline).map((day) => ({
+        day_number: day.dayNumber,
+        date: day.label,
+        event_count: day.events.length,
+        driving_minutes: Math.round(day.drivingMinutes),
+        on_duty_minutes: Math.round(day.onDutyMinutes),
+        off_duty_minutes: Math.round(day.offDutyMinutes),
+        distance_miles: Number(day.distanceMiles.toFixed(2)),
+      })),
       projected_arrival: arrivalTime(timeline),
       route,
       timeline,
@@ -51,6 +66,7 @@ function csvCell(value: string | number | null | undefined): string {
 
 const TIMELINE_COLUMNS = [
   'sequence',
+  'planning_day',
   'start_time',
   'end_time',
   'duration_minutes',
@@ -65,6 +81,14 @@ const TIMELINE_COLUMNS = [
 
 export function buildTimelineCsv({ trip, timeline }: ExportInput): string {
   const lines: string[] = [];
+  const composition = analysePlan(timeline);
+
+  // Which planning day each event belongs to, so the spreadsheet can pivot by
+  // day without re-deriving the grouping from timestamps.
+  const dayOf = new Map<number, number>();
+  for (const day of groupIntoDays(timeline)) {
+    for (const event of day.events) dayOf.set(event.sequence, day.dayNumber);
+  }
 
   // A short provenance block above the table. Spreadsheets tolerate it, and
   // without it an exported file has no way to say which trip it came from.
@@ -73,6 +97,10 @@ export function buildTimelineCsv({ trip, timeline }: ExportInput): string {
     `# Route,${csvCell(`${trip.current_location_text} > ${trip.pickup_location_text} > ${trip.dropoff_location_text}`)}`,
   );
   lines.push(`# Status,${csvCell(trip.status)}`);
+  lines.push(`# Planning days,${csvCell(composition.days)}`);
+  lines.push(
+    `# Inserted,${csvCell(`${composition.breaks} break(s), ${composition.resets} reset(s), ${composition.restarts} restart(s), ${composition.fuelStops} fuel stop(s)`)}`,
+  );
   lines.push(`# Exported,${csvCell(new Date().toISOString())}`);
   lines.push('');
 
@@ -81,6 +109,7 @@ export function buildTimelineCsv({ trip, timeline }: ExportInput): string {
     lines.push(
       [
         event.sequence,
+        dayOf.get(event.sequence) ?? '',
         event.start_time,
         event.end_time,
         Math.round(durationMinutes(event.start_time, event.end_time)),

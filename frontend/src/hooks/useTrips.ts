@@ -13,6 +13,12 @@
  *    an opt-in second pass (`enrich`) that runs after the list renders and
  *    degrades to "—" if it fails. Distance and driving hours need no second
  *    call; they come from `total_distance_miles` / `total_duration_minutes`.
+ *
+ *    That pass keeps the whole timeline, not just the arrival it was originally
+ *    added for. The request is already being made, and the timeline is what a
+ *    history card needs to show how many days the plan spans and how many rests
+ *    the planner inserted — fetching it twice to answer two questions about the
+ *    same data would be the odd choice.
  */
 import { useCallback, useEffect, useState } from 'react';
 import { ApiError, api } from '../lib/apiClient';
@@ -25,6 +31,8 @@ export interface TripRow {
   trip: Trip;
   /** End of the last timeline event; undefined until enrichment resolves. */
   arrival?: string | null;
+  /** The stored timeline; undefined until enrichment resolves, [] if it failed. */
+  timeline?: TimelineEvent[];
 }
 
 interface UseTripsOptions {
@@ -43,6 +51,22 @@ export function useTrips({ status, enrich = false, limit }: UseTripsOptions = {}
   const [reloadToken, setReloadToken] = useState(0);
 
   const reload = useCallback(() => setReloadToken((n) => n + 1), []);
+
+  /**
+   * Drop a trip from the list without waiting for a refetch.
+   *
+   * The delete flow calls this the moment the server confirms, so the row and
+   * the counts derived from it disappear together and immediately. A refetch
+   * still follows to reconcile with the server, but the UI does not sit on a
+   * stale row while that round-trip happens.
+   *
+   * `total` is decremented alongside, or the "N total on server" line would
+   * disagree with the list for as long as the refetch takes.
+   */
+  const removeLocally = useCallback((tripId: string) => {
+    setRows((current) => current.filter((row) => row.trip.id !== tripId));
+    setTotal((current) => Math.max(current - 1, 0));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,21 +94,29 @@ export function useTrips({ status, enrich = false, limit }: UseTripsOptions = {}
 
         if (!enrich) return;
 
-        // Second pass: arrival times. Failures per trip are swallowed so one
-        // bad row cannot blank the whole list.
-        const arrivals = await Promise.all(
-          trimmed.map(async (trip) => {
-            if (trip.status !== 'planned') return null;
+        // Second pass: timelines, for arrival and plan composition. Failures
+        // per trip are swallowed so one bad row cannot blank the whole list.
+        const timelines = await Promise.all(
+          trimmed.map(async (trip): Promise<TimelineEvent[]> => {
+            if (trip.status !== 'planned') return [];
             try {
-              const timeline: TimelineEvent[] = await api.getTimeline(trip.id);
-              return timeline.length > 0 ? timeline[timeline.length - 1].end_time : null;
+              return await api.getTimeline(trip.id);
             } catch {
-              return null;
+              return [];
             }
           }),
         );
         if (cancelled) return;
-        setRows(trimmed.map((trip, index) => ({ trip, arrival: arrivals[index] })));
+        setRows(
+          trimmed.map((trip, index) => ({
+            trip,
+            timeline: timelines[index],
+            arrival:
+              timelines[index].length > 0
+                ? timelines[index][timelines[index].length - 1].end_time
+                : null,
+          })),
+        );
       } catch (cause) {
         if (cancelled) return;
         setError(cause instanceof ApiError ? cause : new ApiError(0, 'Could not load trips.'));
@@ -98,5 +130,5 @@ export function useTrips({ status, enrich = false, limit }: UseTripsOptions = {}
     };
   }, [status, enrich, limit, reloadToken]);
 
-  return { rows, total, loading, error, reload };
+  return { rows, total, loading, error, reload, removeLocally };
 }

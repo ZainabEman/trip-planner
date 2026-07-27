@@ -36,7 +36,6 @@ export interface RuleExplanation {
   remedy: RemedyKind;
   remedyLabel: string;
   /** What a dispatcher can do about it right now. */
-  suggestion: string;
   /** Which clock the numbers below refer to. */
   clock: 'driving' | 'duty' | 'cycle' | 'distance';
   limitValue: number;
@@ -52,8 +51,6 @@ export const RULE_EXPLANATIONS: Record<string, RuleExplanation> = {
     why: 'A driver may not drive more than 11 hours after coming on duty, no matter how the day is arranged.',
     remedy: 'reset_10',
     remedyLabel: '10-hour off-duty reset',
-    suggestion:
-      'A 10-hour break resets the driving clock. Split the run across two days, hand off to a co-driver, or choose a closer delivery.',
     clock: 'driving',
     limitValue: 11,
     unit: 'h',
@@ -66,8 +63,6 @@ export const RULE_EXPLANATIONS: Record<string, RuleExplanation> = {
     why: 'The 14-hour clock does not pause. Loading, waiting and breaks all burn it, so a long dock wait can end the day before the driving does.',
     remedy: 'reset_10',
     remedyLabel: '10-hour off-duty reset',
-    suggestion:
-      'Only 10 consecutive hours off duty reopens the window. Plan a rest partway, start earlier, or shorten the delivery leg.',
     clock: 'duty',
     limitValue: 14,
     unit: 'h',
@@ -80,8 +75,6 @@ export const RULE_EXPLANATIONS: Record<string, RuleExplanation> = {
     why: 'The 8 hours add up across the whole day — they do not have to be consecutive — and driving is barred until a 30-minute non-driving block is taken.',
     remedy: 'break_30',
     remedyLabel: '30-minute break',
-    suggestion:
-      'A 30-minute break clears it. It can be off duty, in the sleeper, or on duty not driving — a fuel or meal stop of that length counts.',
     clock: 'driving',
     limitValue: 8,
     unit: 'h',
@@ -94,8 +87,6 @@ export const RULE_EXPLANATIONS: Record<string, RuleExplanation> = {
     why: 'The cycle counts every on-duty hour — inspections, loading and paperwork included, not just driving.',
     remedy: 'restart_34',
     remedyLabel: '34-hour restart',
-    suggestion:
-      'A 34-hour restart sets the cycle back to zero. Assign a driver with hours available, or schedule the restart before this run.',
     clock: 'cycle',
     limitValue: 70,
     unit: 'h',
@@ -108,8 +99,6 @@ export const RULE_EXPLANATIONS: Record<string, RuleExplanation> = {
     why: 'The planner schedules refuelling every 1,000 miles as a policy constant, independent of duty status.',
     remedy: 'fuel',
     remedyLabel: '30-minute fuel stop',
-    suggestion:
-      'A fuel stop is needed before that point. It also counts toward the 30-minute break requirement.',
     clock: 'distance',
     limitValue: 1000,
     unit: 'mi',

@@ -12,9 +12,19 @@
  *    latitude/longitude columns — the geocoded points reach the client only as
  *    the coordinates attached to each timeline event.
  *
- * Deliberately kept to three markers and two lines. A marker per timeline event
- * would clutter the map without telling a dispatcher anything the timeline does
- * not already say more clearly.
+ * Three **route** markers (origin, pickup, delivery) plus one per stop the
+ * *planner* inserted — breaks, 10-hour resets, 34-hour restarts and fuel stops.
+ * The inserted stops are drawn smaller and in their own colours, so a multi-day
+ * route reads as "the load goes A → B → C, and the rules forced these halts
+ * along the way" rather than as an undifferentiated cloud of pins. Ordinary
+ * inspections and the pickup/dropoff work are still left off: they happen at
+ * markers already on the map.
+ *
+ * The inserted stops sit at the coordinates the engine assigned them, which for
+ * a mid-leg split are interpolated along the straight line between the leg's
+ * endpoints — the engine has the leg's distance and duration but not its
+ * geometry. Their *timing* is exact; only the pin is approximate, and the popup
+ * says so.
  *
  * Markers use `divIcon` rather than Leaflet's default image marker, which avoids
  * the broken-icon-path problem under bundlers and lets each stop be colour-coded.
@@ -24,6 +34,9 @@ import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { decodePolyline } from '../lib/polyline';
 import type { LatLngTuple } from '../lib/polyline';
+import { formatTime } from '../lib/format';
+import { isRemedy } from '../lib/planAnalysis';
+import type { RemedyEventType } from '../lib/planAnalysis';
 import { MAP_COLORS } from '../lib/statusStyles';
 import type { RouteLeg, TimelineEvent } from '../types/api';
 import { EmptyState } from './ui/EmptyState';
@@ -44,6 +57,10 @@ interface Stop {
   name: string;
   color: string;
   position: LatLngTuple;
+  /** Route endpoints are primary; planner-inserted halts are secondary. */
+  kind?: 'route' | 'inserted';
+  /** Extra popup line — the time of a stop, or a caveat about its position. */
+  note?: string;
 }
 
 interface RouteMapProps {
@@ -53,20 +70,26 @@ interface RouteMapProps {
   heightClass?: string;
 }
 
-function markerIcon(label: string, color: string): L.DivIcon {
+function markerIcon(label: string, color: string, kind: 'route' | 'inserted' = 'route'): L.DivIcon {
+  // Inserted stops are deliberately smaller: there can be a dozen of them on a
+  // cross-country plan, and they must not compete with the three markers that
+  // say where the freight is going.
+  const size = kind === 'route' ? 30 : 22;
+  const font = kind === 'route' ? '600 13px' : '600 10px';
+
   return L.divIcon({
     className: '',
     html: `<span style="
       display:flex;align-items:center;justify-content:center;
-      width:30px;height:30px;border-radius:9999px;
+      width:${size}px;height:${size}px;border-radius:9999px;
       background:${color};color:#ffffff;
-      font:600 13px/1 Inter,system-ui,sans-serif;
-      border:2.5px solid #ffffff;
+      font:${font}/1 Inter,system-ui,sans-serif;
+      border:${kind === 'route' ? '2.5px' : '2px'} solid #ffffff;
       box-shadow:0 1px 4px rgba(15,23,42,.35);
     ">${label}</span>`,
-    iconSize: [30, 30],
-    iconAnchor: [15, 15],
-    popupAnchor: [0, -18],
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+    popupAnchor: [0, -size / 2 - 3],
   });
 }
 
@@ -96,11 +119,57 @@ function popupHtml(stop: Stop): string {
       <div style="margin-top:6px;font-weight:600;font-size:13px;color:#0f172a">
         ${escape(stop.name)}
       </div>
+      ${
+        stop.note
+          ? `<div style="margin-top:4px;font:400 11px/1.4 Inter,sans-serif;color:#475569">
+               ${escape(stop.note)}
+             </div>`
+          : ''
+      }
       <div style="margin-top:6px;padding-top:6px;border-top:1px solid #e5e7eb;
                   font:400 11px/1.4 ui-monospace,monospace;color:#64748b">
         ${lat.toFixed(5)}, ${lng.toFixed(5)}
       </div>
     </div>`;
+}
+
+/** Marker colour and short label per inserted stop type. */
+const INSERTED_STYLE: Record<RemedyEventType, { color: string; label: string; role: string }> = {
+  rest_break_30: { color: MAP_COLORS.break, label: 'B', role: '30-minute break' },
+  daily_rest_10: { color: MAP_COLORS.rest, label: 'R', role: '10-hour reset' },
+  cycle_restart_34: { color: MAP_COLORS.restart, label: '34', role: '34-hour restart' },
+  fuel: { color: MAP_COLORS.fuel, label: 'F', role: 'Fuel stop' },
+};
+
+/**
+ * Markers for every stop the planner inserted.
+ *
+ * A stop whose location name is the engine's interpolated "En route to …" form
+ * gets a caveat in its popup, because that pin is on the straight line between
+ * the leg's endpoints rather than on the road.
+ */
+function extractInsertedStops(timeline: TimelineEvent[]): Stop[] {
+  return timeline
+    .filter((event) => isRemedy(event.event_type))
+    .map((event) => {
+      const style = INSERTED_STYLE[event.event_type as RemedyEventType];
+      const interpolated = event.location_name.startsWith('En route to');
+      return {
+        label: style.label,
+        role: style.role,
+        name: event.location_name,
+        color: style.color,
+        position: [Number(event.latitude), Number(event.longitude)] as LatLngTuple,
+        kind: 'inserted' as const,
+        note: [
+          `${formatTime(event.start_time)}–${formatTime(event.end_time)}`,
+          interpolated ? 'Approximate position along the leg' : null,
+        ]
+          .filter(Boolean)
+          .join(' · '),
+      };
+    })
+    .filter((stop) => Number.isFinite(stop.position[0]) && Number.isFinite(stop.position[1]));
 }
 
 /**
@@ -172,6 +241,7 @@ export function RouteMap({
     [route],
   );
   const stops = useMemo(() => extractStops(timeline), [timeline]);
+  const insertedStops = useMemo(() => extractInsertedStops(timeline), [timeline]);
 
   // Create the map once, and tear it down on unmount so a re-mount (React
   // StrictMode double-invokes effects in development) cannot leave Leaflet
@@ -210,11 +280,14 @@ export function RouteMap({
       L.polyline(leg.points, LEG_STYLES[leg.sequence] ?? LEG_STYLES[2]).addTo(overlay);
     }
 
-    for (const stop of stops) {
+    // Inserted stops go down first so the three route markers stay on top
+    // where they overlap — the endpoints matter more than a halt beside them.
+    for (const stop of [...insertedStops, ...stops]) {
       L.marker(stop.position, {
-        icon: markerIcon(stop.label, stop.color),
+        icon: markerIcon(stop.label, stop.color, stop.kind ?? 'route'),
         title: `${stop.role}: ${stop.name}`,
         alt: `${stop.role}: ${stop.name}`,
+        zIndexOffset: stop.kind === 'inserted' ? 0 : 500,
       })
         .bindPopup(popupHtml(stop), { closeButton: true, maxWidth: 260 })
         .addTo(overlay);
@@ -235,7 +308,7 @@ export function RouteMap({
     // plan was loading; nudge it after layout settles.
     const timer = window.setTimeout(() => map.invalidateSize(), 0);
     return () => window.clearTimeout(timer);
-  }, [legs, stops]);
+  }, [legs, stops, insertedStops]);
 
   const hasGeometry = legs.some((leg) => leg.points.length >= 2);
 
@@ -267,8 +340,14 @@ export function RouteMapEmpty() {
   );
 }
 
-/** Legend for the map, kept alongside it so the two stay in sync. */
-export function RouteMapLegend() {
+/**
+ * Legend for the map, kept alongside it so the two stay in sync.
+ *
+ * `hasInserted` is passed rather than inferred so the legend does not advertise
+ * marker types the map is not currently showing — a short single-day trip has
+ * no breaks or resets on it.
+ */
+export function RouteMapLegend({ hasInserted = false }: { hasInserted?: boolean }) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-slate-600">
       {[
@@ -285,6 +364,22 @@ export function RouteMapLegend() {
           {item.label}
         </span>
       ))}
+      {hasInserted &&
+        [
+          { color: MAP_COLORS.break, label: 'Break' },
+          { color: MAP_COLORS.rest, label: '10-hr reset' },
+          { color: MAP_COLORS.restart, label: '34-hr restart' },
+          { color: MAP_COLORS.fuel, label: 'Fuel' },
+        ].map((item) => (
+          <span key={item.label} className="flex items-center gap-1.5">
+            <span
+              aria-hidden="true"
+              className="h-2 w-2 rounded-full ring-1 ring-white"
+              style={{ background: item.color }}
+            />
+            {item.label}
+          </span>
+        ))}
       <span className="flex items-center gap-1.5">
         <span
           aria-hidden="true"

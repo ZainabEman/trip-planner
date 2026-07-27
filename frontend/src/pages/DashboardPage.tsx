@@ -27,6 +27,7 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { hrefFor } from '../hooks/useHashRoute';
+import { useTripDeletion } from '../hooks/useTripDeletion';
 import { useTrips } from '../hooks/useTrips';
 import { buildActivityFeed } from '../lib/activityFeed';
 import { formatDecimal, formatDuration } from '../lib/format';
@@ -37,7 +38,10 @@ import { OperationsActivityFeed } from '../components/OperationsActivityFeed';
 import { TripCard } from '../components/TripCard';
 import { Button } from '../components/ui/Button';
 import { Card } from '../components/ui/Card';
+import { ConfirmDialog } from '../components/ui/ConfirmDialog';
 import { EmptyState } from '../components/ui/EmptyState';
+import { Notice } from '../components/ui/Notice';
+import { PageHeader } from '../components/ui/PageHeader';
 import { StatTile } from '../components/ui/StatTile';
 
 const RECENT_COUNT = 4;
@@ -46,13 +50,17 @@ const ICON = 'h-4 w-4';
 const TILE_ICON = 'h-3.5 w-3.5';
 
 export function DashboardPage() {
-  const { rows, loading, error } = useTrips({ enrich: true });
+  const { rows, loading, error, reload, removeLocally } = useTrips({ enrich: true });
 
   const trips = useMemo(() => rows.map((row) => row.trip), [rows]);
   const kpis = useMemo(() => computeKpis(trips), [trips]);
   const analytics = useMemo(() => computeAnalytics(rows), [rows]);
   const activity = useMemo(() => buildActivityFeed(trips, ACTIVITY_COUNT), [trips]);
   const recent = rows.slice(0, RECENT_COUNT);
+
+  // Deleting from the recent list updates the KPIs and the analytics in the
+  // same render, because all three read the one `rows` set.
+  const deletion = useTripDeletion({ removeLocally, reload });
 
   return (
     <div className="space-y-6">
@@ -62,16 +70,10 @@ export function DashboardPage() {
         className="rounded-xl border border-gray-200 bg-white p-6 shadow-sm sm:p-8"
       >
         <div className="flex flex-wrap items-center justify-between gap-6">
-          <div className="max-w-xl">
-            <h1 className="text-2xl font-semibold tracking-tight text-slate-900">
-              Dispatch operations
-            </h1>
-            <p className="mt-2 text-base leading-relaxed text-slate-600">
-              Plan a compliant trip in one step: three locations and the hours already used in the
-              driver&apos;s 70-hour cycle produce a route, a legal schedule, and a projected
-              arrival.
-            </p>
-          </div>
+          <PageHeader
+            title="Dispatch operations"
+            intro="Plan a compliant trip in one step: three locations and the hours already used in the driver's 70-hour cycle produce a route, a legal multi-day schedule, and a projected arrival."
+          />
           <a href={hrefFor('planner')} className="shrink-0">
             <Button size="lg">
               <Plus aria-hidden="true" className={ICON} />
@@ -80,6 +82,9 @@ export function DashboardPage() {
           </a>
         </div>
       </section>
+
+      {deletion.notice && <Notice tone="success">{deletion.notice}</Notice>}
+      {deletion.error && <Notice tone="error">{deletion.error}</Notice>}
 
       {loading && <DashboardSkeleton />}
 
@@ -297,7 +302,13 @@ export function DashboardPage() {
             >
               <ul className="space-y-3">
                 {recent.map((row) => (
-                  <TripCard key={row.trip.id} trip={row.trip} arrival={row.arrival} />
+                  <TripCard
+                    key={row.trip.id}
+                    trip={row.trip}
+                    arrival={row.arrival}
+                    timeline={row.timeline}
+                    onDelete={deletion.request}
+                  />
                 ))}
               </ul>
             </Card>
@@ -310,6 +321,21 @@ export function DashboardPage() {
         Counts and averages are computed in the browser from the trips API. Planning projections
         only — not an official record of duty status.
       </p>
+
+      <ConfirmDialog
+        open={deletion.pending !== null}
+        busy={deletion.busy}
+        title="Delete this trip?"
+        message="The trip, its route and its timeline will be permanently removed. This cannot be undone."
+        detail={
+          deletion.pending
+            ? `${deletion.pending.current_location_text} → ${deletion.pending.pickup_location_text} → ${deletion.pending.dropoff_location_text}`
+            : undefined
+        }
+        confirmLabel="Delete trip"
+        onConfirm={deletion.confirm}
+        onCancel={deletion.cancel}
+      />
     </div>
   );
 }

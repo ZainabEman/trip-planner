@@ -106,6 +106,35 @@ body {
     display: none !important;
   }
 
+  /*
+   * …except buttons that *are* the content. The planner's decision list wraps
+   * each step in a button so it can highlight the matching timeline event; the
+   * blanket rule above would print that list empty. `print-keep` opts a control
+   * back in and strips its interactive styling.
+   */
+  button.print-keep {
+    display: block !important;
+    background: none !important;
+    padding-left: 0 !important;
+    margin-left: 0 !important;
+  }
+
+  /*
+   * Sticky day headers must not be sticky on paper — a fixed-position element
+   * in a paged context either repeats on every sheet or overlaps the rows it
+   * was pinned above. On paper the header simply sits where it falls, and stays
+   * with the day it introduces.
+   */
+  .sticky {
+    position: static !important;
+  }
+
+  li.sticky {
+    break-after: avoid;
+    page-break-after: avoid;
+    border-top-width: 2px !important;
+  }
+
   .print-only {
     display: block;
   }

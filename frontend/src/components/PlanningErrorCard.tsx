@@ -10,9 +10,10 @@
  * Mapping is by rule id and status code, both of which the backend already
  * sends; nothing here needs a new API field.
  */
-import { AlertTriangle, RefreshCw, WifiOff } from 'lucide-react';
+import { AlertTriangle, ArrowRight, Lightbulb, RefreshCw, WifiOff } from 'lucide-react';
 import { ApiError } from '../lib/apiClient';
 import { explanationFor, readClock } from '../lib/hosExplanations';
+import { suggestionsFor } from '../lib/plannerSuggestions';
 import { Button } from './ui/Button';
 import { Disclosure } from './ui/Disclosure';
 
@@ -24,7 +25,6 @@ interface PlanningErrorCardProps {
 interface Friendly {
   title: string;
   reason: string;
-  suggestion: string;
 }
 
 /** Plain-language explanation per business rule. */
@@ -32,28 +32,22 @@ const RULE_EXPLANATIONS: Record<string, Friendly> = {
   'BR-1': {
     title: 'Trip cannot be completed legally',
     reason: 'The trip needs more than 11 hours of driving in a single duty period.',
-    suggestion: 'Split the load across two days, add a co-driver, or choose a closer delivery.',
   },
   'BR-2': {
     title: 'Trip cannot be completed legally',
     reason: 'The trip exceeds the 14-hour duty window.',
-    suggestion:
-      'A driver may not drive more than 14 hours after coming on duty, even with breaks. Try a shorter delivery or plan a 10-hour reset partway.',
   },
   'BR-4': {
     title: 'Trip cannot be completed legally',
     reason: 'The trip needs more than 8 hours of driving without a 30-minute break.',
-    suggestion: 'A 30-minute break is required before driving again.',
   },
   'BR-8': {
     title: 'Trip cannot be completed legally',
     reason: 'The driver has no hours left in the 70-hour, 8-day cycle.',
-    suggestion: 'A 34-hour restart clears the cycle. Try again with the restart scheduled first.',
   },
   'BR-19': {
     title: 'Trip cannot be completed legally',
     reason: 'The trip runs more than 1,000 miles without a fuel stop.',
-    suggestion: 'A fuel stop is needed before that point.',
   },
 };
 
@@ -66,7 +60,6 @@ function friendlyFor(error: ApiError): Friendly {
     return {
       title: 'Cannot reach the server',
       reason: 'The planner could not connect to the scheduling service.',
-      suggestion: 'Check your connection and try again. If it persists, contact support.',
     };
   }
 
@@ -74,7 +67,6 @@ function friendlyFor(error: ApiError): Friendly {
     return {
       title: 'Location not found',
       reason: `We could not find “${error.details.location}” on the map.`,
-      suggestion: 'Try adding the state — for example “Springfield, IL” instead of “Springfield”.',
     };
   }
 
@@ -82,8 +74,6 @@ function friendlyFor(error: ApiError): Friendly {
     return {
       title: 'No drivable route',
       reason: `There is no road route between ${error.details.origin} and ${error.details.destination}.`,
-      suggestion:
-        'Check the locations. Routes across water or outside the road network are not supported.',
     };
   }
 
@@ -92,40 +82,77 @@ function friendlyFor(error: ApiError): Friendly {
       return {
         title: 'Check the trip details',
         reason: 'One or more entries could not be accepted.',
-        suggestion: 'Review the highlighted fields above and submit again.',
       };
     case 404:
       return {
         title: 'Trip not found',
         reason: 'This trip no longer exists.',
-        suggestion: 'Enter the details again to create a new trip.',
       };
     case 502:
     case 503:
       return {
         title: 'Mapping service unavailable',
         reason: 'The routing provider is not responding right now.',
-        suggestion: 'This is usually brief. Try again in a moment.',
       };
     case 500:
       return {
         title: 'Server error',
         reason: 'Something went wrong on our side while planning this trip.',
-        suggestion: 'Try again. If it keeps happening, contact support.',
       };
     case 422:
       return {
         title: 'Trip cannot be completed legally',
         reason: 'No schedule exists that stays within the hours-of-service limits.',
-        suggestion: 'Try a shorter delivery, or reduce the hours already used in the cycle.',
       };
     default:
       return {
         title: 'Something went wrong',
         reason: 'The trip could not be planned.',
-        suggestion: 'Try again, or contact support if the problem continues.',
       };
   }
+}
+
+/**
+ * The actionable half of the card.
+ *
+ * Split out from the prose above because the two answer different questions:
+ * that explains why the plan failed, this says what to change. The list is
+ * chosen by `suggestionsFor` from the rule id or the error shape, so a cycle
+ * failure and a geocoding failure never offer the same advice.
+ *
+ * Note what is deliberately *not* here any more: "take a 30-minute break",
+ * "schedule a 10-hour reset". The planner inserts those itself now, so a trip
+ * that still fails has already had them — advising them would be telling the
+ * dispatcher to do something that has been done.
+ */
+function SuggestionPanel({ error }: { error: ApiError }) {
+  const { headline, suggestions } = suggestionsFor(error);
+
+  return (
+    <section className="rounded-lg border border-blue-200 bg-blue-50/60 p-4">
+      <h3 className="flex items-center gap-2 text-sm font-semibold text-slate-900">
+        <Lightbulb aria-hidden="true" className="h-4 w-4 text-blue-700" />
+        What to try
+      </h3>
+      <p className="mt-1 text-sm leading-relaxed text-slate-700">{headline}</p>
+      <ul className="mt-3 space-y-2.5">
+        {suggestions.map((suggestion) => (
+          <li key={suggestion.action} className="flex gap-2.5">
+            <ArrowRight
+              aria-hidden="true"
+              className="mt-0.5 h-3.5 w-3.5 shrink-0 text-blue-700"
+            />
+            <div className="min-w-0">
+              <p className="text-sm font-medium text-slate-900">{suggestion.action}</p>
+              <p className="mt-0.5 text-xs leading-relaxed text-slate-600">
+                {suggestion.rationale}
+              </p>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 export function PlanningErrorCard({ error, onRetry }: PlanningErrorCardProps) {
@@ -187,10 +214,10 @@ export function PlanningErrorCard({ error, onRetry }: PlanningErrorCardProps) {
                   What the planner did
                 </dt>
                 <dd className="mt-0.5 leading-relaxed text-slate-700">
-                  Stopped before the limit was broken and returned no schedule, rather than
-                  producing an illegal plan. The legal remedy is a{' '}
-                  <strong className="font-semibold">{rule.remedyLabel}</strong>, which this version
-                  does not yet insert automatically.
+                  Inserted every legal remedy it could — the applicable one here is a{' '}
+                  <strong className="font-semibold">{rule.remedyLabel}</strong> — and still could
+                  not reach the delivery inside the limits. Rather than return an illegal plan it
+                  returned none, so the trip needs a change to its inputs.
                 </dd>
               </div>
             </dl>
@@ -223,35 +250,22 @@ export function PlanningErrorCard({ error, onRetry }: PlanningErrorCardProps) {
               </dl>
             )}
 
-            <p className="mt-3 border-t border-gray-200 pt-3 text-sm leading-relaxed text-slate-700">
-              <span className="font-semibold">What to do: </span>
-              {rule.suggestion}
-            </p>
           </div>
         )}
 
-        <dl className={rule ? 'hidden' : 'space-y-3'}>
-          <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">Reason</dt>
-            <dd className="mt-1 text-sm leading-relaxed text-slate-700">{friendly.reason}</dd>
-          </div>
-          {error.ruleId && (
+        {!rule && (
+          <dl className="space-y-3">
             <div>
-              <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">Rule</dt>
-              <dd className="mt-1">
-                <span className="rounded-md bg-slate-100 px-2 py-0.5 font-mono text-sm font-medium text-slate-700">
-                  {error.ruleId}
-                </span>
-              </dd>
+              <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                Reason
+              </dt>
+              <dd className="mt-1 text-sm leading-relaxed text-slate-700">{friendly.reason}</dd>
             </div>
-          )}
-          <div>
-            <dt className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-              What to try
-            </dt>
-            <dd className="mt-1 text-sm leading-relaxed text-slate-700">{friendly.suggestion}</dd>
-          </div>
-        </dl>
+          </dl>
+        )}
+
+        {/* What a dispatcher can actually do, tailored to the blocking rule. */}
+        <SuggestionPanel error={error} />
 
         {onRetry && error.isRetryable && (
           <Button variant="secondary" onClick={onRetry}>

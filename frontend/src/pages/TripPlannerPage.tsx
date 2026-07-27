@@ -11,11 +11,13 @@
  * to render for the current phase. The result panels are the same components the
  * trip details page uses, so a fresh plan and a stored one look identical.
  */
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { ArrowRight } from 'lucide-react';
 import { tripHref } from '../hooks/useHashRoute';
 import { useTripPlanner } from '../hooks/useTripPlanner';
+import { buildNarrative } from '../lib/planAnalysis';
 import { buildPlanSteps } from '../lib/planSteps';
+import { PlannerNarrative } from '../components/PlannerNarrative';
 import { PlanningActivityLog } from '../components/PlanningActivityLog';
 import { PlanningErrorCard } from '../components/PlanningErrorCard';
 import { DutyStatusGraph } from '../components/DutyStatusGraph';
@@ -39,6 +41,19 @@ const SUBMIT_LABELS = {
 export function TripPlannerPage() {
   const { phase, plan, error, isBusy, submit, retry } = useTripPlanner();
   const steps = useMemo(() => buildPlanSteps(phase, error, plan), [phase, error, plan]);
+  /** Event highlighted across the graph, the timeline and the decision list. */
+  const [selected, setSelected] = useState<number | null>(null);
+
+  const narrative = useMemo(
+    () =>
+      plan
+        ? buildNarrative(plan.timeline, {
+            routeLegs: plan.route.length,
+            distanceMiles: plan.summary.total_distance_miles,
+          })
+        : [],
+    [plan],
+  );
 
   const showActivity = phase !== 'idle';
   const showResults = Boolean(plan) && !isBusy;
@@ -56,33 +71,61 @@ export function TripPlannerPage() {
       {isBusy && <TripStatusBar kind="planning" />}
       {showResults && plan && <TripStatusBar kind="legal" plan={plan} />}
       {phase === 'error' && error && (
+        // An hours-of-service block is a genuine "not legal"; anything else —
+        // a location that will not geocode, a provider outage — leaves the trip
+        // simply unplanned, and must not be reported as a rule violation.
         <TripStatusBar
-          kind="illegal"
+          kind={error.ruleId ? 'illegal' : 'unplanned'}
           reason={
             error.ruleId
-              ? 'The schedule would break a federal hours-of-service limit.'
-              : 'The trip could not be planned. See the details below.'
+              ? 'Every legal rest was inserted and the delivery still could not be reached within the limits.'
+              : 'The route could not be built, so the hours-of-service rules were never reached. See the details below.'
           }
         />
       )}
 
       {/* 2 — Summary */}
       {showResults && plan && (
-        <SummaryCard summary={plan.summary} planningStatus={plan.planning_status} />
+        <SummaryCard
+          summary={plan.summary}
+          planningStatus={plan.planning_status}
+          timeline={plan.timeline}
+        />
       )}
 
-      {/* 3 — Planning activity */}
-      {showActivity && <PlanningActivityLog steps={steps} />}
+      {/* 3 — Planning activity: request stages, then scheduling decisions */}
+      {showActivity && (
+        <div className="grid items-start gap-6 lg:grid-cols-2">
+          <PlanningActivityLog steps={steps} />
+          {showResults && plan && (
+            <PlannerNarrative
+              entries={narrative}
+              selectedSequence={selected}
+              onSelect={setSelected}
+            />
+          )}
+        </div>
+      )}
 
       {phase === 'error' && error && <PlanningErrorCard error={error} onRetry={retry} />}
 
       {/* 4 — Duty status graph */}
-      {showResults && plan && <DutyStatusGraph events={plan.timeline} />}
+      {showResults && plan && (
+        <DutyStatusGraph
+          events={plan.timeline}
+          selectedSequence={selected}
+          onSelect={(event) => setSelected(event ? event.sequence : null)}
+        />
+      )}
 
       {/* 5 & 6 — Timeline beside the map on desktop, stacked below it */}
       {showResults && plan && (
         <div className="grid items-start gap-6 lg:grid-cols-2">
-          <TimelineList events={plan.timeline} />
+          <TimelineList
+            events={plan.timeline}
+            selectedSequence={selected}
+            onSelect={setSelected}
+          />
           <RoutePanel route={plan.route} timeline={plan.timeline} />
         </div>
       )}

@@ -9,9 +9,23 @@
  * routing provider; `total_elapsed_hours` is the whole trip including stops and
  * rest. They differ, so both are shown under distinct labels.
  */
-import { Clock, Gauge, ListOrdered, Moon, Route, Truck, Wrench } from 'lucide-react';
-import type { PlanSummary, TripStatus } from '../types/api';
+import {
+  BedDouble,
+  CalendarRange,
+  Clock,
+  Coffee,
+  Fuel,
+  Gauge,
+  ListOrdered,
+  Moon,
+  Route,
+  RotateCcw,
+  Truck,
+  Wrench,
+} from 'lucide-react';
+import type { PlanSummary, TimelineEvent, TripStatus } from '../types/api';
 import { formatDecimal, formatDuration } from '../lib/format';
+import { analysePlan } from '../lib/planAnalysis';
 import { Badge } from './ui/Badge';
 import { Card } from './ui/Card';
 import { StatTile } from './ui/StatTile';
@@ -21,12 +35,20 @@ import { legalityLabel } from '../lib/tripMetrics';
 interface SummaryCardProps {
   summary: PlanSummary;
   planningStatus: TripStatus;
+  /**
+   * The timeline the summary describes. Supplied wherever it is available, so
+   * the card can report the plan's *composition* — how many days, how many
+   * breaks and resets the planner had to insert — which the API's `summary`
+   * block does not carry and which is the interesting part of a multi-day plan.
+   */
+  timeline?: TimelineEvent[];
 }
 
 const ICON = 'h-3.5 w-3.5';
 
-export function SummaryCard({ summary, planningStatus }: SummaryCardProps) {
+export function SummaryCard({ summary, planningStatus, timeline }: SummaryCardProps) {
   const isLegal = planningStatus === 'planned';
+  const composition = timeline && timeline.length > 0 ? analysePlan(timeline) : null;
 
   return (
     <Card
@@ -50,6 +72,14 @@ export function SummaryCard({ summary, planningStatus }: SummaryCardProps) {
       }
     >
       <dl className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        {composition && (
+          <StatTile
+            label="Trip days"
+            value={composition.days}
+            icon={<CalendarRange className={ICON} />}
+            emphasis
+          />
+        )}
         <StatTile
           label="Total distance"
           value={formatDecimal(summary.total_distance_miles)}
@@ -87,6 +117,48 @@ export function SummaryCard({ summary, planningStatus }: SummaryCardProps) {
           icon={<ListOrdered className={ICON} />}
         />
       </dl>
+
+      {/*
+        What the planner had to insert to make this legal. Shown only when a
+        timeline is available and something was in fact inserted — a short legal
+        trip needs no remedies, and four zeroes would imply the planner failed
+        to do something rather than that nothing was required.
+      */}
+      {composition?.hasRemedies && (
+        <section className="mt-4 rounded-lg border border-gray-200 bg-slate-50 p-4">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+            Inserted to stay compliant
+          </h3>
+          <dl className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-4">
+            {[
+              {
+                label: '30-min breaks',
+                value: composition.breaks,
+                icon: <Coffee className={ICON} />,
+              },
+              {
+                label: '10-hour resets',
+                value: composition.resets,
+                icon: <BedDouble className={ICON} />,
+              },
+              {
+                label: '34-hour restarts',
+                value: composition.restarts,
+                icon: <RotateCcw className={ICON} />,
+              },
+              { label: 'Fuel stops', value: composition.fuelStops, icon: <Fuel className={ICON} /> },
+            ].map((item) => (
+              <StatTile key={item.label} label={item.label} value={item.value} icon={item.icon} />
+            ))}
+          </dl>
+          <p className="mt-3 text-xs leading-relaxed text-slate-500">
+            Added automatically by the planner across {composition.dutyPeriods} duty period
+            {composition.dutyPeriods === 1 ? '' : 's'}, splitting the route into{' '}
+            {composition.drivingSegments} driving segment
+            {composition.drivingSegments === 1 ? '' : 's'}.
+          </p>
+        </section>
+      )}
 
       <p className="mt-4 flex items-start gap-2 text-xs leading-relaxed text-slate-500">
         <Gauge aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />

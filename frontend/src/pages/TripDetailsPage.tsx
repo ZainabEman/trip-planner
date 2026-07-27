@@ -21,9 +21,11 @@ import { hrefFor } from '../hooks/useHashRoute';
 import { ApiError, api } from '../lib/apiClient';
 import { APP_CONTEXT, APP_NAME, REGULATION } from '../lib/appInfo';
 import { formatDateTime } from '../lib/format';
+import { buildNarrative } from '../lib/planAnalysis';
 import { stepsFromStoredTrip } from '../lib/planSteps';
 import { summaryFromStored } from '../lib/tripMetrics';
 import type { RouteLeg, TimelineEvent, Trip } from '../types/api';
+import { PlannerNarrative } from '../components/PlannerNarrative';
 import { PlanningActivityLog } from '../components/PlanningActivityLog';
 import { DutyStatusGraph } from '../components/DutyStatusGraph';
 import { RoutePanel } from '../components/RoutePanel';
@@ -84,6 +86,20 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
 
   const activitySteps = useMemo(
     () => (data ? stepsFromStoredTrip(data.trip, data.timeline.length, data.route.length) : []),
+    [data],
+  );
+
+  // The scheduling decisions inside the timeline stage: each driving segment,
+  // each inserted rest, each resumption. Reconstructed from the stored timeline
+  // — see lib/planAnalysis.ts.
+  const narrative = useMemo(
+    () =>
+      data
+        ? buildNarrative(data.timeline, {
+            routeLegs: data.route.length,
+            distanceMiles: data.trip.total_distance_miles,
+          })
+        : [],
     [data],
   );
 
@@ -189,19 +205,25 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
           kind="legal"
           plan={{ planning_status: trip.status, trip, route, timeline, summary }}
         />
-      ) : (
+      ) : trip.status === 'failed' ? (
         <TripStatusBar
           kind="illegal"
-          reason={
-            trip.status === 'failed'
-              ? 'Planning could not produce a schedule within the hours-of-service limits.'
-              : 'This trip has not been planned yet, so it has no schedule.'
-          }
+          reason="Planning inserted every legal rest it could and still could not reach the delivery within the hours-of-service limits."
+        />
+      ) : (
+        // Pending, not illegal. A routing failure also leaves a trip pending,
+        // and calling that "not legal" would blame the driver's hours for a
+        // problem with the map.
+        <TripStatusBar
+          kind="unplanned"
+          reason="No rule was broken — this trip simply has not been through the planner yet."
         />
       )}
 
       {/* 2 — Trip summary */}
-      {planned && <SummaryCard summary={summary} planningStatus={trip.status} />}
+      {planned && (
+        <SummaryCard summary={summary} planningStatus={trip.status} timeline={timeline} />
+      )}
 
       {/* 3 — Duty status graph, the dispatcher's log view */}
       <DutyStatusGraph
@@ -219,8 +241,21 @@ export function TripDetailsPage({ tripId }: { tripId: string }) {
       {/* 5 — Trip information */}
       <TripInformationCard trip={trip} timeline={timeline} route={route} />
 
-      {/* 6 — Planner activity */}
-      <PlanningActivityLog steps={activitySteps} />
+      {/*
+        6 — Planner activity, in two parts. The request stages answer "did
+        planning work"; the decisions answer "what did it schedule, and why".
+        Side by side on desktop because they are read together.
+      */}
+      <div className="grid items-start gap-6 lg:grid-cols-2">
+        <PlanningActivityLog steps={activitySteps} />
+        {planned && (
+          <PlannerNarrative
+            entries={narrative}
+            selectedSequence={selected}
+            onSelect={setSelected}
+          />
+        )}
+      </div>
     </div>
   );
 }
