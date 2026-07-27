@@ -1,22 +1,24 @@
 const SIZES = {
   sm: 'h-4 w-4 border-2',
-  md: 'h-6 w-6 border-2',
-  lg: 'h-10 w-10 border-[3px]',
+  md: 'h-5 w-5 border-2',
+  lg: 'h-8 w-8 border-[3px]',
 } as const;
 
 interface SpinnerProps {
   size?: keyof typeof SIZES;
-  label?: string;
+  /** Accessible name. Pass `null` when an adjacent live region already announces progress. */
+  label?: string | null;
 }
 
-export function Spinner({ size = 'md', label }: SpinnerProps) {
+export function Spinner({ size = 'md', label = 'Loading' }: SpinnerProps) {
   return (
     <span
-      role="status"
-      aria-label={label ?? 'Loading'}
+      role={label ? 'status' : undefined}
+      aria-hidden={label ? undefined : 'true'}
+      aria-label={label ?? undefined}
       className={[
-        'inline-block animate-spin rounded-full',
-        'border-current border-t-transparent opacity-80',
+        'inline-block shrink-0 animate-spin rounded-full',
+        'border-current border-t-transparent',
         SIZES[size],
       ].join(' ')}
     />

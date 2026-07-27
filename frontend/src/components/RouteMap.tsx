@@ -12,29 +12,36 @@
  *    latitude/longitude columns — the geocoded points reach the client only as
  *    the coordinates attached to each timeline event.
  *
- * Markers use `divIcon` rather than Leaflet's default image marker, which
- * avoids the well-known broken-icon-path problem under bundlers and lets each
- * stop be colour-coded and numbered.
+ * Deliberately kept to three markers and two lines. A marker per timeline event
+ * would clutter the map without telling a dispatcher anything the timeline does
+ * not already say more clearly.
+ *
+ * Markers use `divIcon` rather than Leaflet's default image marker, which avoids
+ * the broken-icon-path problem under bundlers and lets each stop be colour-coded.
  */
 import { useEffect, useMemo, useRef } from 'react';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
+import { MapIcon } from 'lucide-react';
 import { decodePolyline } from '../lib/polyline';
 import type { LatLngTuple } from '../lib/polyline';
+import { MAP_COLORS } from '../lib/statusStyles';
 import type { RouteLeg, TimelineEvent } from '../types/api';
+import { EmptyState } from './ui/EmptyState';
 
 const TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 const TILE_ATTRIBUTION =
   '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-/** Leg 1 is the unloaded deadhead, leg 2 the loaded haul — drawn differently. */
+/** Leg 1 is the unloaded deadhead, leg 2 the loaded haul. */
 const LEG_STYLES: Record<number, L.PolylineOptions> = {
-  1: { color: '#64748b', weight: 4, opacity: 0.85, dashArray: '8 8' },
-  2: { color: '#0ea5e9', weight: 5, opacity: 0.9 },
+  1: { color: MAP_COLORS.deadhead, weight: 4, opacity: 0.9, dashArray: '7 7' },
+  2: { color: MAP_COLORS.loaded, weight: 5, opacity: 0.95 },
 };
 
 interface Stop {
   label: string;
+  role: string;
   name: string;
   color: string;
   position: LatLngTuple;
@@ -43,7 +50,7 @@ interface Stop {
 interface RouteMapProps {
   route: RouteLeg[];
   timeline: TimelineEvent[];
-  /** Tailwind height class; the container must have a fixed height for Leaflet. */
+  /** Tailwind height classes; the container needs a fixed height for Leaflet. */
   heightClass?: string;
 }
 
@@ -52,16 +59,30 @@ function markerIcon(label: string, color: string): L.DivIcon {
     className: '',
     html: `<span style="
       display:flex;align-items:center;justify-content:center;
-      width:28px;height:28px;border-radius:9999px;
-      background:${color};color:#020617;
-      font:700 12px/1 Inter,sans-serif;
-      border:2px solid rgba(255,255,255,.9);
-      box-shadow:0 2px 8px rgba(0,0,0,.5);
+      width:30px;height:30px;border-radius:9999px;
+      background:${color};color:#ffffff;
+      font:600 13px/1 Inter,system-ui,sans-serif;
+      border:2.5px solid #ffffff;
+      box-shadow:0 1px 4px rgba(15,23,42,.35);
     ">${label}</span>`,
-    iconSize: [28, 28],
-    iconAnchor: [14, 14],
-    popupAnchor: [0, -16],
+    iconSize: [30, 30],
+    iconAnchor: [15, 15],
+    popupAnchor: [0, -18],
   });
+}
+
+function popupHtml(stop: Stop): string {
+  const escape = (value: string) => value.replace(/[&<>"]/g, (ch) => `&#${ch.charCodeAt(0)};`);
+  return `
+    <div style="min-width:150px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+        <span style="width:8px;height:8px;border-radius:9999px;background:${stop.color}"></span>
+        <span style="font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:#64748b">
+          ${escape(stop.role)}
+        </span>
+      </div>
+      <div style="font-weight:600;color:#0f172a">${escape(stop.name)}</div>
+    </div>`;
 }
 
 /**
@@ -80,20 +101,33 @@ function extractStops(timeline: TimelineEvent[]): Stop[] {
 
   const origin = timeline[0];
   if (origin) {
-    stops.push({ label: 'A', name: origin.location_name, color: '#e2e8f0', position: at(origin) });
+    stops.push({
+      label: 'A',
+      role: 'Current location',
+      name: origin.location_name,
+      color: MAP_COLORS.current,
+      position: at(origin),
+    });
   }
 
   const pickup = timeline.find((event) => event.event_type === 'pickup');
   if (pickup) {
-    stops.push({ label: 'B', name: pickup.location_name, color: '#f59e0b', position: at(pickup) });
+    stops.push({
+      label: 'B',
+      role: 'Pickup',
+      name: pickup.location_name,
+      color: MAP_COLORS.pickup,
+      position: at(pickup),
+    });
   }
 
   const dropoff = timeline.find((event) => event.event_type === 'dropoff');
   if (dropoff) {
     stops.push({
       label: 'C',
+      role: 'Delivery',
       name: dropoff.location_name,
-      color: '#34d399',
+      color: MAP_COLORS.delivery,
       position: at(dropoff),
     });
   }
@@ -103,7 +137,11 @@ function extractStops(timeline: TimelineEvent[]): Stop[] {
   );
 }
 
-export function RouteMap({ route, timeline, heightClass = 'h-[420px]' }: RouteMapProps) {
+export function RouteMap({
+  route,
+  timeline,
+  heightClass = 'h-[320px] sm:h-[420px] lg:h-[560px]',
+}: RouteMapProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<L.Map | null>(null);
   const overlayRef = useRef<L.LayerGroup | null>(null);
@@ -123,9 +161,14 @@ export function RouteMap({ route, timeline, heightClass = 'h-[420px]' }: RouteMa
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return;
 
-    const map = L.map(containerRef.current, { scrollWheelZoom: false, zoomControl: true });
+    const map = L.map(containerRef.current, {
+      // Page scrolling wins over zooming; ctrl/⌘ + wheel still zooms.
+      scrollWheelZoom: false,
+      zoomControl: true,
+      attributionControl: true,
+    });
     L.tileLayer(TILE_URL, { attribution: TILE_ATTRIBUTION, maxZoom: 19 }).addTo(map);
-    map.setView([39.5, -98.35], 4); // Continental US, until we have a route to fit.
+    map.setView([39.5, -98.35], 4); // Continental US, until there is a route to fit.
     overlayRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
 
@@ -152,10 +195,10 @@ export function RouteMap({ route, timeline, heightClass = 'h-[420px]' }: RouteMa
     for (const stop of stops) {
       L.marker(stop.position, {
         icon: markerIcon(stop.label, stop.color),
-        title: stop.name,
-        keyboard: false,
+        title: `${stop.role}: ${stop.name}`,
+        alt: `${stop.role}: ${stop.name}`,
       })
-        .bindPopup(`<strong>${stop.label}</strong> &middot; ${stop.name}`)
+        .bindPopup(popupHtml(stop), { closeButton: true, maxWidth: 260 })
         .addTo(overlay);
     }
 
@@ -167,7 +210,7 @@ export function RouteMap({ route, timeline, heightClass = 'h-[420px]' }: RouteMa
     if (fitPoints.length === 1) {
       map.setView(fitPoints[0], 11);
     } else if (fitPoints.length > 1) {
-      map.fitBounds(L.latLngBounds(fitPoints), { padding: [36, 36] });
+      map.fitBounds(L.latLngBounds(fitPoints), { padding: [40, 40] });
     }
 
     // Leaflet mis-measures a container that was hidden or resized while the
@@ -183,44 +226,61 @@ export function RouteMap({ route, timeline, heightClass = 'h-[420px]' }: RouteMa
       <div
         ref={containerRef}
         role="application"
-        aria-label="Route map"
-        className={`w-full ${heightClass} bg-slate-950`}
+        aria-label="Route map showing the current location, pickup and delivery"
+        className={`w-full ${heightClass}`}
       />
-      {!hasGeometry && (
-        <p className="absolute inset-x-0 bottom-0 bg-slate-950/80 px-4 py-2 text-center text-xs text-slate-400">
-          No route geometry was returned for this trip — showing stop markers only.
+      {!hasGeometry && stops.length > 0 && (
+        <p className="absolute inset-x-0 bottom-0 z-[400] bg-white/95 px-4 py-2 text-center text-xs text-slate-600">
+          No route line was returned for this trip — showing stop markers only.
         </p>
       )}
     </div>
   );
 }
 
+/** Empty state for the map panel, before a trip has been planned. */
+export function RouteMapEmpty() {
+  return (
+    <EmptyState
+      icon={<MapIcon className="h-5 w-5" />}
+      title="No route available"
+      description="Plan a trip to see the deadhead and loaded legs drawn on the map."
+    />
+  );
+}
+
 /** Legend for the map, kept alongside it so the two stay in sync. */
 export function RouteMapLegend() {
-  const items = [
-    { swatch: '#e2e8f0', label: 'A — Current' },
-    { swatch: '#f59e0b', label: 'B — Pickup' },
-    { swatch: '#34d399', label: 'C — Dropoff' },
-  ];
-
   return (
-    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-slate-400">
-      {items.map((item) => (
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-slate-600">
+      {[
+        { color: MAP_COLORS.current, label: 'A Current' },
+        { color: MAP_COLORS.pickup, label: 'B Pickup' },
+        { color: MAP_COLORS.delivery, label: 'C Delivery' },
+      ].map((item) => (
         <span key={item.label} className="flex items-center gap-1.5">
           <span
             aria-hidden="true"
             className="h-2.5 w-2.5 rounded-full"
-            style={{ background: item.swatch }}
+            style={{ background: item.color }}
           />
           {item.label}
         </span>
       ))}
       <span className="flex items-center gap-1.5">
-        <span aria-hidden="true" className="h-0.5 w-5 border-t-2 border-dashed border-slate-500" />
+        <span
+          aria-hidden="true"
+          className="h-0 w-5 border-t-2 border-dashed"
+          style={{ borderColor: MAP_COLORS.deadhead }}
+        />
         Deadhead
       </span>
       <span className="flex items-center gap-1.5">
-        <span aria-hidden="true" className="h-0.5 w-5 bg-sky-500" />
+        <span
+          aria-hidden="true"
+          className="h-[3px] w-5 rounded-full"
+          style={{ background: MAP_COLORS.loaded }}
+        />
         Loaded
       </span>
     </div>

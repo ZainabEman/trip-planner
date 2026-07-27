@@ -85,6 +85,14 @@ export interface TripPlan {
   summary: PlanSummary;
 }
 
+/** DRF PageNumberPagination envelope, as returned by `GET /api/trips/`. */
+export interface Paginated<T> {
+  count: number;
+  next: string | null;
+  previous: string | null;
+  results: T[];
+}
+
 /** Payload accepted by `POST /api/trips/`. */
 export interface CreateTripPayload {
   current_location_text: string;

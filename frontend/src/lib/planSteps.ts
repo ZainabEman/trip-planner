@@ -1,0 +1,113 @@
+/**
+ * The planning activity log — what happened while planning, not what the driver
+ * will do. (The driver's schedule is the trip timeline; see TimelineList.)
+ *
+ * An honesty note on granularity: the workflow is **two** HTTP calls, not four.
+ * `POST /trips/` is step 1; `POST /trips/{id}/plan/` performs routing, rule
+ * evaluation and timeline construction server-side in a single request, so the
+ * client cannot observe when one finishes and the next begins.
+ *
+ * Rather than fake a timed march through the steps — which would tick
+ * "Timeline generated" before the server had generated anything — steps 2–4 are
+ * shown as one in-flight group: the earliest incomplete step spins, the rest
+ * stay pending, and all three complete together when the response lands.
+ *
+ * Failure attribution *is* real, and is derived entirely from data the API
+ * already sends: a `rule_id` means the HOS check rejected the schedule, a
+ * `location`/`origin` detail means routing failed. Nothing here is invented.
+ */
+import { ApiError } from './apiClient';
+import type { PlannerPhase } from '../hooks/useTripPlanner';
+import type { TripPlan } from '../types/api';
+
+export type StepState = 'pending' | 'active' | 'complete' | 'failed';
+
+export interface PlanStep {
+  id: 'create' | 'route' | 'rules' | 'timeline';
+  label: string;
+  state: StepState;
+  /** Short factual outcome, shown beside the step once it resolves. */
+  detail?: string;
+}
+
+const LABELS: Record<PlanStep['id'], string> = {
+  create: 'Trip created',
+  route: 'Route generated',
+  rules: 'HOS rules checked',
+  timeline: 'Timeline generated',
+};
+
+const ORDER: PlanStep['id'][] = ['create', 'route', 'rules', 'timeline'];
+
+/** Which stage an error belongs to, from the error the API returned. */
+function failedStage(error: ApiError | null): PlanStep['id'] | null {
+  if (!error) return null;
+  // A rule violation is reported with the blocking rule's id.
+  if (error.ruleId) return 'rules';
+  // Geocoding / no-drivable-route / provider failures all happen while routing.
+  if (error.details.location || error.details.origin || error.isRetryable) return 'route';
+  if (error.statusCode === 422 || error.statusCode === 500 || error.statusCode === 502) {
+    return 'route';
+  }
+  // Anything else (network down, validation on create) failed before routing.
+  return 'create';
+}
+
+/** Factual per-step detail, taken from the plan response or the error. */
+function detailFor(
+  id: PlanStep['id'],
+  state: StepState,
+  plan: TripPlan | null,
+  error: ApiError | null,
+): string | undefined {
+  if (state === 'failed') {
+    if (id === 'rules' && error?.ruleId) return `Blocked by ${error.ruleId}`;
+    if (id === 'route' && error?.details.location)
+      return `Could not locate ${error.details.location}`;
+    if (id === 'route' && error?.details.origin) return 'No drivable route between two points';
+    return error?.statusCode === 0 ? 'Server unreachable' : 'Failed';
+  }
+  if (state !== 'complete' || !plan) return undefined;
+  switch (id) {
+    case 'create':
+      return 'Saved';
+    case 'route':
+      return `${plan.route.length} legs · ${plan.summary.total_distance_miles ?? '—'} mi`;
+    case 'rules':
+      return 'No violations';
+    case 'timeline':
+      return `${plan.summary.event_count} events`;
+  }
+}
+
+export function buildPlanSteps(
+  phase: PlannerPhase,
+  error: ApiError | null,
+  plan: TripPlan | null = null,
+): PlanStep[] {
+  const stage = failedStage(error);
+
+  return ORDER.map((id, index) => {
+    let state: StepState = 'pending';
+
+    if (phase === 'done') {
+      state = 'complete';
+    } else if (phase === 'creating') {
+      state = index === 0 ? 'active' : 'pending';
+    } else if (phase === 'planning') {
+      // Step 1 genuinely finished; 2–4 are the single server round-trip.
+      state = index === 0 ? 'complete' : index === 1 ? 'active' : 'pending';
+    } else if (phase === 'error' && stage) {
+      const failedIndex = ORDER.indexOf(stage);
+      if (index < failedIndex) state = 'complete';
+      else if (index === failedIndex) state = 'failed';
+      else state = 'pending';
+    }
+
+    return { id, label: LABELS[id], state, detail: detailFor(id, state, plan, error) };
+  });
+}
+
+export function stepsComplete(steps: PlanStep[]): boolean {
+  return steps.every((step) => step.state === 'complete');
+}

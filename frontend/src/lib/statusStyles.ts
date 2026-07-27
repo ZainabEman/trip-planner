@@ -3,20 +3,38 @@
  *
  * Kept out of Badge.tsx so that file exports only its component (React Fast
  * Refresh degrades when a module mixes components with other exports), and
- * because the map needs the solid colours without importing a badge.
+ * because the map and the timeline rail need the solid colours without
+ * importing a badge.
  */
 import type { DutyStatus, TripStatus } from '../types/api';
 
 export type BadgeTone =
-  'driving' | 'onDuty' | 'offDuty' | 'sleeper' | 'success' | 'danger' | 'neutral';
+  | 'brand'
+  | 'success'
+  | 'warning'
+  | 'danger'
+  | 'neutral'
+  | 'driving'
+  | 'onDuty'
+  | 'offDuty'
+  | 'sleeper';
 
-/** Solid colours matching the badge tones, for the map polyline and rail markers. */
+/** Solid colours matching the badge tones, for the map and the timeline rail. */
 export const DUTY_STATUS_COLORS: Record<DutyStatus, string> = {
-  driving: '#0ea5e9',
-  on_duty_not_driving: '#f59e0b',
+  driving: '#2563eb',
+  on_duty_not_driving: '#d97706',
   off_duty: '#64748b',
-  sleeper_berth: '#8b5cf6',
+  sleeper_berth: '#7c3aed',
 };
+
+/** Map marker colours, per the design system. */
+export const MAP_COLORS = {
+  current: '#2563eb',
+  pickup: '#d97706',
+  delivery: '#16a34a',
+  deadhead: '#94a3b8',
+  loaded: '#2563eb',
+} as const;
 
 export function dutyStatusTone(status: DutyStatus): BadgeTone {
   switch (status) {
@@ -40,6 +58,19 @@ export function tripStatusTone(status: TripStatus): BadgeTone {
       return 'danger';
     case 'pending':
     default:
-      return 'neutral';
+      return 'warning';
+  }
+}
+
+/** Plain-language label for a trip status, for drivers rather than developers. */
+export function tripStatusLabel(status: TripStatus): string {
+  switch (status) {
+    case 'planned':
+      return 'Planned';
+    case 'failed':
+      return 'Failed';
+    case 'pending':
+    default:
+      return 'Pending';
   }
 }

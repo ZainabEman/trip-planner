@@ -9,8 +9,12 @@ import type {
   ApiErrorDetails,
   ApiErrorEnvelope,
   CreateTripPayload,
+  Paginated,
+  RouteLeg,
+  TimelineEvent,
   Trip,
   TripPlan,
+  TripStatus,
 } from '../types/api';
 
 const API_BASE_URL: string =
@@ -96,6 +100,33 @@ export const api = {
   /** Runs the full workflow: route, plan, persist. Takes no body (docs/api.md). */
   planTrip(tripId: string): Promise<TripPlan> {
     return request<TripPlan>(`/trips/${tripId}/plan/`, { method: 'POST' });
+  },
+
+  /**
+   * One page of trips. Server-side `status` filter and `ordering` only —
+   * the endpoint has no text search, so free-text filtering is done on the
+   * client over the pages already loaded (see `useTrips`).
+   */
+  listTrips(
+    options: { status?: TripStatus; ordering?: string; page?: number } = {},
+  ): Promise<Paginated<Trip>> {
+    const query = new URLSearchParams();
+    if (options.status) query.set('status', options.status);
+    query.set('ordering', options.ordering ?? '-created_at');
+    if (options.page && options.page > 1) query.set('page', String(options.page));
+    return request<Paginated<Trip>>(`/trips/?${query.toString()}`);
+  },
+
+  getTrip(tripId: string): Promise<Trip> {
+    return request<Trip>(`/trips/${tripId}/`);
+  },
+
+  getTimeline(tripId: string): Promise<TimelineEvent[]> {
+    return request<TimelineEvent[]>(`/trips/${tripId}/timeline/`);
+  },
+
+  getRoute(tripId: string): Promise<RouteLeg[]> {
+    return request<RouteLeg[]>(`/trips/${tripId}/route/`);
   },
 };
 

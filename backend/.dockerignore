@@ -1,0 +1,25 @@
+# The host virtualenv must never enter the image: it is platform-specific
+# (a Windows venv here) and the image installs its own dependencies from
+# requirements.txt. Copying it also bloats the build context by ~30MB+.
+venv/
+.venv/
+env/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Regenerated inside the container by collectstatic.
+staticfiles/
+
+# Local-only artefacts.
+*.sqlite3
+db.sqlite3
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+.git/
+.gitignore
+.env

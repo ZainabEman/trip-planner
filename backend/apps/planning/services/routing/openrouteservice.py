@@ -25,6 +25,26 @@ logger = logging.getLogger(__name__)
 METERS_PER_MILE = Decimal('1609.344')
 DRIVING_PROFILE = 'driving-car'
 
+# How far the router may search for a road to start/end a leg on.
+#
+# openrouteservice defaults to 350 m, which geocoded centroids routinely fall
+# outside: /geocode/search returns the centroid of a place's polygon, and for
+# many places — Oklahoma City, OK and San Antonio, TX among them — that point
+# sits further than 350 m from any road in the OSM graph. The directions call
+# then returns HTTP 404 with error code 2010 ("Could not find routable point
+# within a radius of 350.0 meters"), which carries no `routes` key and so
+# surfaces to the user as "no drivable route" for a place that is perfectly
+# drivable.
+#
+# Bounded at 5 km rather than -1 (unlimited) on purpose: a genuinely
+# unroutable coordinate — mid-ocean, or off the road network entirely — must
+# still fail with RouteNotFoundError rather than silently snapping to some
+# arbitrarily distant road. The trade-off is that a leg's endpoints are the
+# *snapped* positions, so reported mileage can differ from a door-to-door
+# figure by up to this radius (consistent with Assumption A-19: the engine
+# works with routed positions, not real street addresses).
+SNAP_RADIUS_METERS = 5000
+
 # Status codes worth one retry before giving up: rate limits and transient server errors.
 _TRANSIENT_STATUS_CODES = frozenset({403, 429, 500, 502, 503, 504})
 
@@ -100,7 +120,9 @@ class OpenRouteServiceProvider(RoutingProvider):
                 'coordinates': [
                     [origin.longitude, origin.latitude],
                     [destination.longitude, destination.latitude],
-                ]
+                ],
+                # One radius per coordinate, as the API requires.
+                'radiuses': [SNAP_RADIUS_METERS, SNAP_RADIUS_METERS],
             },
         )
 
