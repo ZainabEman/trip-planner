@@ -285,18 +285,22 @@ class CombinedEvaluatorTests(SimpleTestCase):
     def test_driving_limit_reached_before_duty_window(self):
         # Two 6h legs: at leg 2, cumulative driving hits 12h (>11, blocked)
         # while elapsed duty-window time is only 12h (<14, would still allow).
+        # The block no longer ends the plan — it schedules the reset BR-1 asks
+        # for and carries on — but the driving limit must still be the rule
+        # that binds, and the reset must be what gets inserted.
         engine = PlanningEngine(evaluators=[DrivingLimitEvaluator(), DutyWindowEvaluator()])
         context = make_context(6 * 60, 6 * 60)
 
         result = engine.plan(context)
 
-        # Leg 1: window allowed, limit allowed. Leg 2: window allowed, limit blocked -> stop.
-        self.assertEqual(len(result.rule_results), 4)
-        self.assertTrue(result.rule_results[0].allowed)
-        self.assertTrue(result.rule_results[1].allowed)
-        self.assertTrue(result.rule_results[2].allowed)
-        self.assertFalse(result.rule_results[3].allowed)
-        self.assertEqual(result.rule_results[3].evaluator_name, 'DrivingLimitEvaluator')
+        blocking = [rule for rule in result.rule_results if not rule.allowed]
+        self.assertEqual([rule.evaluator_name for rule in blocking], ['DrivingLimitEvaluator'])
+        self.assertIs(blocking[0].required_action, RequiredAction.RESET_10)
+        self.assertIn(
+            EventType.DAILY_REST_10, [event.event_type for event in result.events]
+        )
+        # And the trip completes rather than stopping there.
+        self.assertEqual(result.events[-1].event_type, EventType.POSTTRIP_INSPECTION)
 
     def test_duty_window_reached_before_driving_limit(self):
         # Not reachable end-to-end yet with only driving legs (both clocks
@@ -312,18 +316,23 @@ class CombinedEvaluatorTests(SimpleTestCase):
         self.assertFalse(window_result.allowed)
         self.assertTrue(limit_result.allowed)
 
-    def test_engine_stops_processing_after_a_block_and_does_not_evaluate_further_legs(self):
+    def test_a_block_on_the_first_leg_no_longer_abandons_the_later_ones(self):
+        # The inverse of what this asserted before remedies existed. Leg 1
+        # alone exceeds the driving limit, which used to end the plan and leave
+        # legs 2 and 3 unplanned; now it splits leg 1 around a reset and goes
+        # on to deliver.
         engine = PlanningEngine(evaluators=[DrivingLimitEvaluator(), DutyWindowEvaluator()])
-        # Leg 1 alone already exceeds the driving limit; a 3rd leg exists
-        # but must never be reached.
         context = make_context(12 * 60, 5 * 60, 5 * 60)
 
         result = engine.plan(context)
 
-        # Only leg 1 evaluated: window (allowed, 12<14) then limit (blocked, 12>11).
-        self.assertEqual(len(result.rule_results), 2)
-        self.assertTrue(result.rule_results[0].allowed)
-        self.assertFalse(result.rule_results[1].allowed)
+        event_types = [event.event_type for event in result.events]
+        self.assertIn(EventType.DAILY_REST_10, event_types)
+        self.assertEqual(event_types[-1], EventType.POSTTRIP_INSPECTION)
+        # Every leg was driven, and leg 1 arrived as two segments around the
+        # reset rather than one illegal 12-hour block.
+        self.assertGreater(event_types.count(EventType.DRIVE), 3)
+        self.assertEqual(event_types.count(EventType.PICKUP), 2)
 
     def test_all_four_evaluators_run_in_priority_order(self):
         engine = PlanningEngine(evaluators=list(reversed(ALL_EVALUATORS)))
@@ -345,12 +354,15 @@ class CombinedEvaluatorTests(SimpleTestCase):
 
         result = engine.plan(context)
 
-        # Leg 1: window, break, limit, fuel all allowed (4.5h/225mi).
-        # Leg 2: window allowed, break blocked -> stop before driving-limit/fuel run.
-        self.assertEqual(len(result.rule_results), 6)
-        self.assertTrue(result.rule_results[4].allowed)  # leg 2 window
-        self.assertFalse(result.rule_results[5].allowed)  # leg 2 break
-        self.assertEqual(result.rule_results[5].evaluator_name, 'BreakEvaluator')
+        # BR-4 binds first, so the cheap remedy is chosen: a 30-minute break,
+        # not a 10-hour reset. Getting this wrong costs the driver nine and a
+        # half hours, which is why the break must be the *only* rest inserted.
+        blocking = [rule for rule in result.rule_results if not rule.allowed]
+        self.assertEqual([rule.evaluator_name for rule in blocking], ['BreakEvaluator'])
+
+        event_types = [event.event_type for event in result.events]
+        self.assertIn(EventType.REST_BREAK_30, event_types)
+        self.assertNotIn(EventType.DAILY_REST_10, event_types)
 
     def test_fuel_blocks_a_leg_that_all_time_based_rules_would_allow(self):
         # A short (3h) but very long-distance (1200mi) leg: legal on every
@@ -360,12 +372,16 @@ class CombinedEvaluatorTests(SimpleTestCase):
 
         result = engine.plan(context)
 
-        self.assertEqual(len(result.rule_results), 4)
-        self.assertTrue(result.rule_results[0].allowed)  # window
-        self.assertTrue(result.rule_results[1].allowed)  # break
-        self.assertTrue(result.rule_results[2].allowed)  # driving limit
-        self.assertFalse(result.rule_results[3].allowed)  # fuel
-        self.assertEqual(result.rule_results[3].evaluator_name, 'FuelEvaluator')
+        blocking = [rule for rule in result.rule_results if not rule.allowed]
+        self.assertEqual([rule.evaluator_name for rule in blocking], ['FuelEvaluator'])
+
+        # The leg splits at the fuel interval, and the two driving segments
+        # still add up to the leg.
+        driving = [e for e in result.events if e.event_type == EventType.DRIVE]
+        self.assertEqual(len(driving), 2)
+        self.assertEqual(driving[0].distance_miles, Decimal('1000.00'))
+        self.assertEqual(sum(e.distance_miles for e in driving), Decimal('1200.00'))
+        self.assertIn(EventType.FUEL, [e.event_type for e in result.events])
 
 
 class EdgeCaseTests(SimpleTestCase):
@@ -426,22 +442,29 @@ class EdgeCaseTests(SimpleTestCase):
 
         result = engine.plan(context)
 
-        self.assertEqual(len(result.rule_results), 2)
-        self.assertTrue(result.rule_results[0].allowed)  # DutyWindowEvaluator: 12 < 14
-        self.assertFalse(result.rule_results[1].allowed)  # DrivingLimitEvaluator: 12 > 11
+        blocking = [rule for rule in result.rule_results if not rule.allowed]
+        self.assertEqual([rule.evaluator_name for rule in blocking], ['DrivingLimitEvaluator'])
+        # Split at the driving limit: 11 hours, then the remaining hour.
+        driving = [e for e in result.events if e.event_type == EventType.DRIVE]
+        self.assertEqual(driving[0].end_time - driving[0].start_time, timedelta(hours=11))
 
-    def test_single_very_long_leg_exceeding_both_limits_stops_at_the_first_priority_check(self):
-        # 20h exceeds both the 11h driving limit and the 14h window. Since
-        # DutyWindowEvaluator has higher priority (runs first) and blocks
-        # immediately, DrivingLimitEvaluator must never even be invoked.
+    def test_the_constraint_that_binds_soonest_wins_over_the_higher_priority_one(self):
+        # 20h exceeds both the 11h driving limit and the 14h window, so both
+        # rules block. DutyWindowEvaluator has the higher priority and would
+        # have won under first-block-wins — but it does not bind first: the
+        # pre-trip inspection has already spent 15 minutes of the window,
+        # leaving 13.75h of it against the driving limit's full 11h.
+        #
+        # Observable in the split point. Binding on the window would drive
+        # 13.75 hours, which is 2.75 hours past the 11-hour limit and flatly
+        # illegal; binding on the limit drives 11.
         engine = PlanningEngine(evaluators=[DrivingLimitEvaluator(), DutyWindowEvaluator()])
         context = make_context(20 * 60)
 
         result = engine.plan(context)
 
-        self.assertEqual(len(result.rule_results), 1)
-        self.assertEqual(result.rule_results[0].evaluator_name, 'DutyWindowEvaluator')
-        self.assertFalse(result.rule_results[0].allowed)
+        first_drive = next(e for e in result.events if e.event_type == EventType.DRIVE)
+        self.assertEqual(first_drive.end_time - first_drive.start_time, timedelta(hours=11))
 
     def test_negative_hours_rejected_by_evaluation_context(self):
         with self.assertRaises(InvalidEvaluationContextError):
@@ -465,12 +488,12 @@ class EdgeCaseTests(SimpleTestCase):
 
         result = engine.plan(context)
 
-        self.assertEqual(len(result.rule_results), 4)
-        self.assertTrue(result.rule_results[0].allowed)
-        self.assertTrue(result.rule_results[1].allowed)
-        self.assertTrue(result.rule_results[2].allowed)
-        self.assertFalse(result.rule_results[3].allowed)
-        self.assertEqual(result.rule_results[3].evaluator_name, 'FuelEvaluator')
+        blocking = [rule for rule in result.rule_results if not rule.allowed]
+        self.assertEqual([rule.evaluator_name for rule in blocking], ['FuelEvaluator'])
+
+        driving = [e for e in result.events if e.event_type == EventType.DRIVE]
+        self.assertEqual(driving[0].distance_miles, Decimal('1000.00'))
+        self.assertEqual(sum(e.distance_miles for e in driving), Decimal('1500.00'))
 
 
 class RequiredActionTests(SimpleTestCase):

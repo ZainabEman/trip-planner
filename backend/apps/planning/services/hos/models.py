@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     # are referenced here only for annotations. `from __future__ import
     # annotations` above makes every annotation a string, so nothing is
     # evaluated at runtime.
-    from apps.planning.services.hos.cursor import PlanningDay, PlanningPause
+    from apps.planning.services.hos.cursor import PlanningActivity, PlanningDay, PlanningPause
 
 from apps.planning.choices import DutyStatus, EventType
 from apps.planning.services.hos.exceptions import (
@@ -148,11 +148,20 @@ class EvaluationContext:
     window) are independent clocks that will diverge once non-driving
     activity (breaks, fuel, inspections) is introduced in a later phase.
 
-    `cumulative_driving_hours` is also read by BreakEvaluator (BR-4's
-    8-cumulative-hour trigger) — a separate rule, but the same underlying
-    running total, since the engine does not yet model a break resetting
-    one clock without resetting the other (that distinction only matters
-    once break/reset events actually exist).
+    `driving_hours_since_break` is BR-4's own clock, and exists because the
+    engine now schedules breaks. BR-4 (8 cumulative driving hours) and BR-1
+    (11 driving hours per duty period) read the *same* running total right up
+    until a 30-minute break is taken: a break clears BR-4's trigger but does
+    **not** give back any of the 11 hours. One field cannot express both once
+    breaks exist, so BreakEvaluator reads this one.
+
+    It is `None`-by-default rather than zero-by-default on purpose. A caller
+    that does not know about the distinction — every pre-12B construction of
+    this DTO, and every direct unit test of BreakEvaluator — leaves it unset,
+    and BR-4 falls back to `cumulative_driving_hours`, which is exactly the
+    old behaviour. Defaulting it to zero instead would silently tell BR-4 that
+    a fresh break had just been taken, which is the wrong answer in the unsafe
+    direction.
 
     `cumulative_distance_miles`/`proposed_distance_miles` exist for
     FuelEvaluator (BR-19's 1,000-mile interval) and default to zero so
@@ -179,6 +188,7 @@ class EvaluationContext:
     proposed_distance_miles: Decimal = Decimal('0')
     cumulative_cycle_hours: Decimal = Decimal('0')
     proposed_on_duty_hours: Decimal = Decimal('0')
+    driving_hours_since_break: Decimal | None = None
 
     def __post_init__(self) -> None:
         if self.cumulative_driving_hours < 0:
@@ -195,6 +205,8 @@ class EvaluationContext:
             raise InvalidEvaluationContextError('cumulative_cycle_hours cannot be negative.')
         if self.proposed_on_duty_hours < 0:
             raise InvalidEvaluationContextError('proposed_on_duty_hours cannot be negative.')
+        if self.driving_hours_since_break is not None and self.driving_hours_since_break < 0:
+            raise InvalidEvaluationContextError('driving_hours_since_break cannot be negative.')
 
 
 @dataclass(frozen=True)
@@ -230,21 +242,25 @@ class RuleResult:
 class PlanningResult:
     """Successful output of the planning pipeline.
 
-    `days` and `pause` are additive and default to empty, so every existing
-    construction and every caller that reads only `events`/`rule_results`
-    keeps working unchanged:
+    `days`, `pause` and `activity` are additive and default to empty, so every
+    caller that reads only `events`/`rule_results` keeps working unchanged:
 
-    * `days` groups the finished timeline by calendar date. A trip no longer
-      has to fit in one duty period, so the result has to be able to describe
-      more than one day.
-    * `pause` is set instead of `days` when planning stopped short: it records
-      which rule blocked, where on the leg the truck ran out of clock, and how
-      much of the leg is left. Nothing consumes it yet — it is what Phase 12B's
-      remedy insertion resumes from.
+    * `days` groups the finished timeline by calendar date. A trip is no longer
+      assumed to fit in one duty period, so a plan routinely spans several.
+    * `pause` is set **only** when planning could not continue — that is, when
+      the binding rule named no remedy the engine can schedule, or when
+      scheduling one made no progress. A rule that merely blocks is no longer a
+      failure: the engine inserts the remedy and resumes, so a blocked
+      `RuleResult` now appears in `rule_results` on plenty of *successful*
+      plans, marking the point where a break or a reset was inserted.
+    * `activity` is the narrative of the run — trip created, route generated,
+      each driving segment completed, each remedy inserted, planning resumed,
+      destination reached. It is derived state for reporting and is neither
+      persisted nor serialised; nothing in the API contract depends on it.
 
-    Note that `events` is still empty whenever `pause` is set. The engine does
-    not emit a partial timeline (BR-37/NFR-2.4); the pause is metadata about
-    the stop, not a half-finished plan.
+    `events` is still empty whenever `pause` is set. The engine does not emit a
+    partial timeline (BR-37/NFR-2.4); the pause is metadata about why no
+    compliant plan exists, not a half-finished plan.
     """
 
     context: PlanningContext
@@ -252,6 +268,7 @@ class PlanningResult:
     rule_results: tuple[RuleResult, ...] = ()
     days: tuple['PlanningDay', ...] = ()
     pause: 'PlanningPause | None' = None
+    activity: tuple['PlanningActivity', ...] = ()
 
 
 @dataclass(frozen=True)

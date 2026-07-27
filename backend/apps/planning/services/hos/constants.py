@@ -71,10 +71,25 @@ FUEL_INTERVAL_MILES = Decimal('1000')
 CYCLE_RESTART_HOURS = Decimal('34')
 
 # BR-4, BR-5 — the qualifying non-driving block that clears the
-# 8-cumulative-hour break trigger. Defined here for completeness alongside
-# its trigger above; not yet consumed, because PlanningEngine does not
-# schedule the BREAK_30 remedy yet.
+# 8-cumulative-hour break trigger. Scheduled by RemedyEngine.
 THIRTY_MINUTE_BREAK_HOURS = Decimal('0.5')
+
+# BR-7 / 49 CFR 395.3(a) — the consecutive off-duty block that ends one
+# duty period and opens the next, clearing both the 11-hour driving clock
+# and the 14-hour window. Scheduled by RemedyEngine.
+#
+# Note this is the *minimum* qualifying reset, and the engine schedules
+# exactly the minimum: a longer rest is always legal but would push the
+# delivery out further than the rules require.
+TEN_HOUR_RESET_HOURS = Decimal('10')
+
+# BR-20 — how long a scheduled fuel stop takes, taken On Duty (Not
+# Driving). Set equal to THIRTY_MINUTE_BREAK_HOURS deliberately and not
+# by coincidence: at exactly 30 minutes the stop is long enough to
+# double as the BR-4 break (BR-6/BR-34), which is why RemedyEngine marks
+# the fuel remedy as satisfying the break trigger. Shortening this below
+# 30 minutes would silently invalidate that merge.
+FUEL_STOP_HOURS = Decimal('0.5')
 
 # BR-21 — the inspection that opens a duty period, taken On Duty (Not
 # Driving). Emitted at trip start, and again after a 34-hour restart on
@@ -93,7 +108,3 @@ POSTTRIP_INSPECTION_HOURS = Decimal('0.25')
 # entity exists to parameterise them).
 PICKUP_HOURS = Decimal('1.0')
 DROPOFF_HOURS = Decimal('1.0')
-
-# Deliberately not yet defined, to avoid unused constants that read as
-# dead code: BR-7's 10-hour reset duration and BR-20's 30-minute fuel
-# stop. Each belongs here when the phase that schedules it lands.

@@ -21,10 +21,44 @@ from apps.planning.services.hos.cursor import (
 )
 from apps.planning.services.hos.engine import PlanningEngine
 from apps.planning.services.hos.evaluators import default_evaluators
+from apps.planning.services.hos.evaluators.base import RuleEvaluator
 from apps.planning.services.hos.event_factory import EventFactory
-from apps.planning.services.hos.models import PlanningContext, RouteLegInput
+from apps.planning.services.hos.models import (
+    EvaluationContext,
+    PlanningContext,
+    RequiredAction,
+    RouteLegInput,
+    RuleResult,
+)
 
 START = datetime(2026, 8, 1, 8, 0, tzinfo=dt_timezone.utc)
+
+
+class UnremediableEvaluator(RuleEvaluator):
+    """A rule that forbids all driving and names no remedy.
+
+    Since remedies were introduced, essentially every real trip is plannable —
+    a long enough one just takes more days — so an evaluator like this is the
+    only way to reach the engine's give-up path deliberately. It is also the
+    honest test of the contract: the engine fails when, and only when, no legal
+    continuation exists.
+    """
+
+    def priority(self) -> int:
+        return 99
+
+    def evaluate(self, context: EvaluationContext) -> RuleResult:
+        if context.proposed_driving_hours <= 0:
+            # Must allow the zero-hour pre-flight probe, or it would be
+            # mistaken for an exhausted cycle.
+            return RuleResult(allowed=True, evaluator_name='UnremediableEvaluator', reason='ok')
+        return RuleResult(
+            allowed=False,
+            evaluator_name='UnremediableEvaluator',
+            reason='Driving is forbidden and nothing can make it legal.',
+            required_action=RequiredAction.NONE,
+            rule_id='BR-TEST',
+        )
 
 
 def make_leg(sequence: int, duration_minutes: int, distance_miles: str) -> RouteLegInput:
@@ -86,16 +120,55 @@ class ClockEngineTests(SimpleTestCase):
         self.assertEqual(cursor.clocks.cycle_hours, Decimal('2'))
         self.assertEqual(cursor.clocks.distance_miles, Decimal('100'))
 
-    def test_off_duty_passes_time_without_accruing_duty_or_cycle(self):
+    def test_off_duty_passes_time_without_accruing_cycle_hours(self):
         cursor = self.cursor('40')
         cursor.advance(PlannerAction.CYCLE_RESTART, Decimal('34'), counts_as_on_duty=False)
 
         self.assertEqual(cursor.current_time, START + timedelta(hours=34))
         self.assertEqual(cursor.clocks.elapsed_hours, Decimal('34'))
-        self.assertEqual(cursor.clocks.duty_window_hours, Decimal('0'))
         # The cycle carries the hours it arrived with; the restart clears it
         # separately, which is a different operation.
         self.assertEqual(cursor.clocks.cycle_hours, Decimal('40'))
+
+    def test_off_duty_still_spends_the_fourteen_hour_window(self):
+        # BR-2/BR-24: the window is 14 *consecutive* hours and does not pause
+        # for rest. A short break spends it while giving nothing back — which
+        # is the whole reason a break is not a substitute for a reset. Only
+        # open_new_duty_period clears it.
+        cursor = self.cursor()
+        cursor.advance(PlannerAction.BREAK, Decimal('0.5'), counts_as_on_duty=False)
+
+        self.assertEqual(cursor.clocks.duty_window_hours, Decimal('0.5'))
+        self.assertEqual(cursor.clocks.cycle_hours, Decimal('0'))
+
+        cursor.open_new_duty_period()
+        self.assertEqual(cursor.clocks.duty_window_hours, Decimal('0'))
+
+    def test_a_break_clears_only_the_break_trigger(self):
+        # The narrowest of the four remedies, and the one whose scope matters
+        # most: widening it is the easiest way to emit an illegal plan.
+        cursor = self.cursor()
+        cursor.advance_minutes(PlannerAction.DRIVING, 8 * 60, counts_as_driving=True)
+
+        cursor.take_break()
+
+        self.assertEqual(cursor.clocks.driving_since_break_hours, Decimal('0'))
+        # BR-1's eleven hours and BR-2's fourteen are untouched by a break.
+        self.assertEqual(cursor.clocks.driving_hours, Decimal('8'))
+        self.assertEqual(cursor.clocks.duty_window_hours, Decimal('8'))
+        self.assertEqual(cursor.clocks.cycle_hours, Decimal('8'))
+
+    def test_refuelling_clears_only_the_fuel_interval(self):
+        cursor = self.cursor()
+        cursor.advance_minutes(
+            PlannerAction.DRIVING, 60, distance_miles=Decimal('900'), counts_as_driving=True
+        )
+
+        cursor.refuel()
+
+        self.assertEqual(cursor.clocks.distance_since_fuel_miles, Decimal('0'))
+        # The trip total is a different number and keeps accumulating.
+        self.assertEqual(cursor.clocks.distance_miles, Decimal('900'))
 
     def test_reset_cycle_and_new_duty_period_clear_their_own_clocks(self):
         cursor = self.cursor('70')
@@ -219,16 +292,23 @@ class PlanningDayTests(SimpleTestCase):
 
 
 class PlanningPauseTests(SimpleTestCase):
-    """A blocked leg now records where it stopped — the input Phase 12B needs."""
+    """A pause is now a dead end, not an ordinary block.
 
-    def blocked(self):
-        # 20 hours of driving on leg 2 breaches the 14-hour duty window.
-        return plan(make_leg(1, 46, '35.90'), make_leg(2, 20 * 60, '1100.00'))
+    The 20-hour leg these tests were written against in Phase 12A no longer
+    pauses at all — it is scheduled across two days (see RemedyTests). Reaching
+    a pause requires a rule that names no remedy, which is what
+    `UnremediableEvaluator` supplies.
+    """
 
-    def test_a_blocked_trip_still_returns_no_events(self):
+    def blocked(self, *legs: RouteLegInput):
+        engine = PlanningEngine(evaluators=[*default_evaluators(), UnremediableEvaluator()])
+        return engine.plan(make_context(*legs))
+
+    def test_a_trip_with_no_legal_continuation_returns_no_events(self):
         result = self.blocked()
 
-        # Unchanged behaviour: no partial timeline is emitted (BR-37, FR-4.5).
+        # Unchanged behaviour: no partial timeline is emitted (BR-37, FR-4.5),
+        # even though the engine got as far as the pre-trip inspection.
         self.assertEqual(result.events, ())
         self.assertEqual(result.days, ())
 
@@ -236,47 +316,34 @@ class PlanningPauseTests(SimpleTestCase):
         pause = self.blocked().pause
 
         self.assertIsNotNone(pause)
-        self.assertEqual(pause.leg_sequence, 2)
-        self.assertEqual(pause.rule_id, 'BR-2')
-        self.assertEqual(pause.evaluator_name, 'DutyWindowEvaluator')
-        self.assertEqual(pause.required_action, 'reset_10')
-
-    def test_the_pause_splits_the_leg_into_drivable_and_remaining(self):
-        pause = self.blocked().pause
-
-        # The two parts must reconstitute the leg exactly — that is what makes
-        # the record usable for resuming rather than merely informative.
-        self.assertAlmostEqual(
-            pause.drivable_miles + pause.remaining_distance_miles,
-            Decimal('1100.00'),
-            places=2,
-        )
-        self.assertGreater(pause.drivable_miles, 0)
-        self.assertGreater(pause.remaining_distance_miles, 0)
-        self.assertGreater(pause.remaining_duration_minutes, 0)
-        self.assertLess(pause.remaining_duration_minutes, 20 * 60)
+        self.assertEqual(pause.leg_sequence, 1)
+        self.assertEqual(pause.rule_id, 'BR-TEST')
+        self.assertEqual(pause.evaluator_name, 'UnremediableEvaluator')
+        self.assertEqual(pause.required_action, 'none')
 
     def test_the_pause_captures_the_clocks_and_the_moment(self):
-        result = self.blocked()
-        pause = result.pause
+        pause = self.blocked().pause
 
-        # Paused after leg 1 and its pickup: pre-trip 0.25 + drive 0.766 + pickup 1.
+        # Paused at the first driving decision, immediately after the pre-trip
+        # inspection that opened the duty period.
         self.assertEqual(pause.clocks.duty_window_hours, pause.clocks.cycle_hours)
-        self.assertGreater(pause.clocks.elapsed_hours, Decimal('0'))
-        self.assertEqual(pause.paused_at, START + timedelta(minutes=15 + 46 + 60))
+        self.assertEqual(pause.paused_at, START + timedelta(minutes=15))
 
     def test_a_successful_plan_records_no_pause(self):
         self.assertIsNone(plan().pause)
 
-    def test_planning_stops_at_the_first_pause(self):
-        # Leg 2 blocks, so leg 3 is never evaluated.
-        result = plan(
-            make_leg(1, 46, '35.90'),
-            make_leg(2, 20 * 60, '1100.00'),
-            make_leg(3, 60, '50.00'),
-        )
+    def test_a_successful_multi_day_plan_records_no_pause(self):
+        # The case that used to pause. A rule blocking is now routine.
+        result = plan(make_leg(1, 46, '35.90'), make_leg(2, 20 * 60, '1100.00'))
 
-        self.assertEqual(result.pause.leg_sequence, 2)
+        self.assertIsNone(result.pause)
+        self.assertTrue(any(not rule.allowed for rule in result.rule_results))
+
+    def test_planning_stops_at_the_first_dead_end(self):
+        # Leg 1 has no legal continuation, so leg 2 is never reached.
+        result = self.blocked(make_leg(1, 60, '50.00'), make_leg(2, 60, '50.00'))
+
+        self.assertEqual(result.pause.leg_sequence, 1)
 
 
 class RegressionTests(SimpleTestCase):

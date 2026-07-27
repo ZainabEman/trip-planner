@@ -14,6 +14,7 @@ from apps.planning.choices import DutyStatus, EventType, TripStatus
 from apps.planning.models import TimelineEvent, Trip
 from apps.planning.services.hos.engine import PlanningEngine
 from apps.planning.services.hos.evaluators import default_evaluators
+from apps.planning.services.hos.test_cursor import UnremediableEvaluator
 from apps.planning.services.planning_service import (
     TripNotPlannableError,
     TripPlanningService,
@@ -219,11 +220,68 @@ class PlanningMetricsTests(TestCase):
         self.assertEqual(trip.total_duration_minutes, 300)
 
 
+class MultiDayPersistenceTests(TestCase):
+    """A 20-hour leg used to be unplannable. It is now a two-day schedule, and
+    the whole of it has to survive the round trip to the database.
+    """
+
+    def _planned(self):
+        trip = make_trip()
+        service = make_service(StubRoutingService(route_result(leg_2_minutes=20 * 60)))
+        return trip, service.plan_trip(trip)
+
+    def test_remedy_events_are_persisted(self):
+        trip, _ = self._planned()
+
+        stored = [row.event_type for row in TimelineEvent.objects.filter(trip=trip)]
+
+        self.assertIn(EventType.REST_BREAK_30, stored)
+        self.assertIn(EventType.DAILY_REST_10, stored)
+        self.assertEqual(stored[-1], EventType.POSTTRIP_INSPECTION)
+
+    def test_the_persisted_timeline_is_still_gap_free_across_days(self):
+        trip, _ = self._planned()
+
+        rows = list(TimelineEvent.objects.filter(trip=trip))
+
+        self.assertGreater(rows[-1].end_time - rows[0].start_time, timedelta(days=1))
+        for previous, current in zip(rows, rows[1:]):
+            with self.subTest(sequence=current.sequence):
+                self.assertEqual(current.start_time, previous.end_time)
+
+    def test_split_driving_distances_still_sum_to_the_route(self):
+        # Persistence quantises to two decimal places, so this checks the split
+        # survives the database rather than only the engine.
+        trip, _ = self._planned()
+
+        driven = sum(
+            row.distance_miles
+            for row in TimelineEvent.objects.filter(trip=trip, event_type=EventType.DRIVE)
+        )
+
+        self.assertEqual(driven, Decimal('935.00'))
+
+    def test_off_duty_hours_include_the_inserted_rest(self):
+        _, result = self._planned()
+
+        # One 10-hour reset plus a 30-minute break in each of the two duty
+        # periods — BR-4's trigger fires once per period, since the reset
+        # clears it along with everything else.
+        self.assertEqual(result.off_duty_hours, Decimal('11.0'))
+        # Driving is the whole route's duration and no more: 2h on leg 1 plus
+        # the 20h of leg 2, split but not lengthened.
+        self.assertEqual(result.driving_hours, Decimal('22'))
+
+
 class PlanningFailureTests(TestCase):
     def _unplannable_service(self) -> TripPlanningService:
-        # A 20-hour second leg breaches the 14-hour duty window, and no remedy
-        # for that is scheduled yet.
-        return make_service(StubRoutingService(route_result(leg_2_minutes=20 * 60)))
+        # Since remedies were introduced a long trip is not unplannable, only
+        # slow — it takes more days. Reaching the failure path takes a rule
+        # that names no remedy at all.
+        return TripPlanningService(
+            routing_service=StubRoutingService(),
+            engine=PlanningEngine(evaluators=[*default_evaluators(), UnremediableEvaluator()]),
+        )
 
     def test_unplannable_trip_raises(self):
         trip = make_trip()
@@ -255,10 +313,13 @@ class PlanningFailureTests(TestCase):
             self._unplannable_service().plan_trip(trip)
 
         # Structured, so an API layer can surface them as fields rather than
-        # parsing them back out of the message.
-        self.assertEqual(ctx.exception.rule_id, 'BR-2')
-        self.assertEqual(ctx.exception.evaluator_name, 'DutyWindowEvaluator')
-        self.assertIn('14-hour duty window', ctx.exception.reason)
+        # parsing them back out of the message. The rule named is the one the
+        # engine could not get past — taken from the pause, not from the last
+        # blocked RuleResult, which on a multi-day plan is just wherever a
+        # break happened to be due.
+        self.assertEqual(ctx.exception.rule_id, 'BR-TEST')
+        self.assertEqual(ctx.exception.evaluator_name, 'UnremediableEvaluator')
+        self.assertIn('nothing can make it legal', ctx.exception.reason)
         self.assertEqual(ctx.exception.trip_id, trip.id)
 
     def test_a_previously_planned_timeline_is_cleared_on_a_failed_replan(self):

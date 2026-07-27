@@ -518,18 +518,26 @@ POST /api/trips/87a6c8b9-5a04-46c2-914d-2498a0be70c1/plan/
 {
   "error": {
     "status_code": 422,
-    "message": "Driving 20h would bring elapsed duty-window time to 23.25h, exceeding the 14-hour duty window (BR-2).",
+    "message": "Driving 3h would bring cumulative on-duty time to 71h, exceeding the 70-hour/8-day cycle limit (BR-8). Only a 34-hour restart clears the cycle (BR-10).",
     "details": {
-      "detail": "Driving 20h would bring elapsed duty-window time to 23.25h, exceeding the 14-hour duty window (BR-2).",
+      "detail": "Driving 3h would bring cumulative on-duty time to 71h, exceeding the 70-hour/8-day cycle limit (BR-8). Only a 34-hour restart clears the cycle (BR-10).",
       "trip_id": "41e22782-7515-42b5-a818-fcc3b60264c0",
-      "rule_id": "BR-2",
-      "evaluator": "DutyWindowEvaluator"
+      "rule_id": "BR-8",
+      "evaluator": "CycleLimitEvaluator"
     }
   }
 }
 ```
 
-`rule_id` is the business rule that blocked the plan (`BR-1` 11-hour limit, `BR-2` 14-hour window, `BR-4` 30-minute break, `BR-8` 70-hour cycle, `BR-19` fuel interval); `evaluator` is the component that reported it.
+`rule_id` is the business rule the planner could not get past (`BR-1` 11-hour limit, `BR-2` 14-hour window, `BR-4` 30-minute break, `BR-8` 70-hour cycle, `BR-19` fuel interval); `evaluator` is the component that reported it.
+
+> **A rule blocking is no longer a failure.** The planner inserts the legal
+> remedy for the rule — a 30-minute break, a 10-hour reset, a fuel stop, a
+> 34-hour restart — and resumes from where it stopped, so a trip too long for
+> one duty period comes back `200` as a multi-day plan rather than `422`. A
+> `422` from the HOS engine now means no legal continuation exists at all,
+> which in practice is rare: most `422`s from this endpoint are geocoding or
+> routing failures. See the two examples below.
 
 **Example response — location cannot be geocoded — `422`**
 
@@ -604,9 +612,9 @@ curl -s "$BASE/trips/$ID/"          | python -m json.tool   # status: "planned"
 # 4. Re-plan — replaces, does not duplicate
 curl -s -X POST "$BASE/trips/$ID/plan/" | python -c 'import sys,json; d=json.load(sys.stdin); print(len(d["timeline"]), "events;", len(d["route"]), "legs")'
 
-# 5. Force a 422: a cycle already at the 70-hour limit still plans (restart is
-#    inserted), so instead use a dropoff far enough to breach the 14-hour window
-curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE/trips/$ID/plan/"
+# 5. A long-haul dropoff no longer 422s — it comes back as a multi-day plan
+#    with breaks, fuel stops and 10-hour resets inserted
+curl -s -X POST "$BASE/trips/$LONG_ID/plan/" | python -c 'import sys,json,collections; d=json.load(sys.stdin); print(collections.Counter(e["event_type"] for e in d["timeline"]))'
 
 # 6. Show the error envelope for an unknown trip (404)
 curl -s -X POST "$BASE/trips/00000000-0000-0000-0000-000000000000/plan/" | python -m json.tool
@@ -657,7 +665,8 @@ Note: the upper bound on `cycle_hours_used` (≤ 70) is not enforced by the API 
 - [ ] After planning, `GET .../timeline/` and `.../route/` return byte-identical arrays to the plan response's `timeline`/`route`
 - [ ] After planning, `GET /api/trips/{id}/` shows `status: "planned"` and populated `total_distance_miles`/`total_duration_minutes`
 - [ ] `POST /api/trips/{id}/plan/` with `cycle_hours_used: "70.00"` → first timeline event is `cycle_restart_34`, `summary.off_duty_hours` is `"34.00"`
-- [ ] `POST /api/trips/{id}/plan/` for a dropoff far enough to breach the 14-hour window → `422`, `details.rule_id` is `"BR-2"`, trip `status` becomes `failed`, `GET .../timeline/` returns `[]`
+- [ ] `POST /api/trips/{id}/plan/` for a dropoff far enough to breach the 14-hour window → `200` with a multi-day plan: `timeline` contains `rest_break_30` and `daily_rest_10`, the driving rows' `distance_miles` still sum to `summary.total_distance_miles`, and consecutive events remain gap-free
+- [ ] `POST /api/trips/{id}/plan/` for a 2,000-mile-plus dropoff → `200`, `timeline` also contains `fuel`, and one `pretrip_inspection` per duty period opened
 - [ ] `POST /api/trips/{id}/plan/` with a nonsense dropoff (e.g. `"Nowhere, ZZ"`) → `422` with `details.location`
 - [ ] `POST /api/trips/{bad-uuid}/plan/` → `404` in the error envelope
 - [ ] `GET /api/trips/{id}/plan/` → `405 Method Not Allowed`

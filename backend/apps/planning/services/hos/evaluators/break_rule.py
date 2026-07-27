@@ -8,7 +8,7 @@ The break itself may be Off Duty, Sleeper Berth, or On Duty (Not
 Driving) (BR-5), and an already-required non-driving stop of at least
 30 minutes can satisfy it instead of a standalone break (BR-6/BR-34) —
 but which duty status the break takes, and whether it gets merged with
-another stop, are event-scheduling decisions for a later phase. This
+another stop, are RemedyEngine's decisions, not this evaluator's. This
 evaluator only decides whether a proposed driving increment fits inside
 the remaining 8-hour budget before a break becomes mandatory.
 
@@ -39,7 +39,17 @@ class BreakEvaluator(RuleEvaluator):
         return 30
 
     def evaluate(self, context: EvaluationContext) -> RuleResult:
-        projected = context.cumulative_driving_hours + context.proposed_driving_hours
+        # BR-4 counts driving hours *since the last qualifying break*, which
+        # stops being the same number as BR-1's per-duty-period total the
+        # moment a break is actually taken. Callers that predate breaks leave
+        # `driving_hours_since_break` unset and get the old reading — see
+        # EvaluationContext for why that fallback is `None` and not zero.
+        cumulative = (
+            context.cumulative_driving_hours
+            if context.driving_hours_since_break is None
+            else context.driving_hours_since_break
+        )
+        projected = cumulative + context.proposed_driving_hours
 
         if projected > EIGHT_HOUR_BREAK_TRIGGER:
             return RuleResult(
@@ -51,7 +61,7 @@ class BreakEvaluator(RuleEvaluator):
                     f'exceeding the 8-cumulative-hour break trigger (BR-4).'
                 ),
                 remaining_driving_hours=max(
-                    EIGHT_HOUR_BREAK_TRIGGER - context.cumulative_driving_hours, Decimal('0')
+                    EIGHT_HOUR_BREAK_TRIGGER - cumulative, Decimal('0')
                 ),
                 required_action=RequiredAction.BREAK_30,
                 rule_id=_RULE_ID,

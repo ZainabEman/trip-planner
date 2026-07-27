@@ -1,37 +1,38 @@
 """PlanningEngine — the single entry point into the HOS planning pipeline.
 
-An **iterative scheduler**, not a single pass over legs. The engine walks a
-queue of `PlannerAction`s against a `PlanningCursor` that carries the clock,
-the route position and the accumulating timeline. Each turn of the loop takes
-the next action, evaluates it if it consumes driving time, advances the cursor,
-and continues until the destination is reached or planning pauses.
+A **multi-day scheduler**. The engine walks a `PlanningCursor` along the route,
+and when a rule forbids the next stretch of driving it does not give up: it
+drives as far as the rule allows, inserts the remedy that rule named, resets the
+clocks the remedy clears, and resumes from exactly where it stopped.
 
-    while not cursor.destination_reached:
-        action = next action for the cursor
-        if action consumes driving time:
-            evaluate against the current clocks
-            if blocked: record the pause and stop
-        emit the event and advance the cursor
+    while destination not reached:
+        offer the rest of the current leg to the rules
+        if every rule allows it:
+            drive it, do the work waiting at the end, move to the next leg
+        else:
+            pick the constraint that binds *soonest*
+            drive as far as that constraint permits
+            insert its remedy, reset what the remedy clears, resume
 
-No recursion, and one place where each kind of event is emitted.
+Failure is now a genuinely exceptional outcome. A trip fails only when the
+binding rule names no remedy the engine can schedule, or when scheduling one
+moves nothing — not merely because some rule blocked. Rules block constantly on
+a legal multi-day plan; that is what a break *is*.
 
-The trip is no longer assumed to fit in a single duty window: the cursor tracks
-cycle hours and elapsed time across the whole run, and the finished timeline is
-grouped into `PlanningDay`s so a multi-day schedule is representable.
+Three properties the loop is built to guarantee:
 
-Behaviour this phase deliberately leaves unchanged:
+* **Mileage is conserved.** A leg split across several driving events always
+  sums back to the leg's own distance, because each segment's distance is
+  *subtracted* from the leg total rather than recomputed (see `_remaining_of`).
+* **It terminates.** Two independent guards: a no-progress detector that catches
+  a remedy which cannot help, and a hard iteration ceiling behind it.
+* **A partial plan is never returned.** If planning cannot reach the delivery,
+  the result carries no events at all (BR-37/NFR-2.4, FR-4.5) — the
+  `PlanningPause` explains why.
 
-* **A blocked leg still yields no events.** The engine records a `PlanningPause`
-  describing where it stopped and how much of the leg remains, but returns an
-  empty timeline — emitting a plan that stops short of the delivery would break
-  FR-4.5 and BR-37. Phase 12B turns that pause into an inserted remedy.
-* **One evaluation per leg, first block wins by priority.** Splitting a leg into
-  several evaluated increments changes which rule binds first, so it waits for
-  12B's nearest-binding-constraint work.
-* **The pre-flight 34-hour restart** remains the only remedy scheduled.
-
-A successful plan produces a contiguous, gap-free timeline spanning trip start
-to delivery completion exactly (FR-4.1, FR-4.5):
+A successful plan is a contiguous, gap-free timeline spanning trip start to
+delivery completion exactly (FR-4.1, FR-4.5). A short trip still produces
+exactly what it always did:
 
     Pre-Trip Inspection (BR-21, opens the 14h window per BR-24)
       -> Driving        (leg 1)
@@ -40,25 +41,33 @@ to delivery completion exactly (FR-4.1, FR-4.5):
       -> Dropoff        (BR-18, 1 h On Duty)
       -> Post-Trip Inspection (BR-22, closes the duty period)
 
-with a Cycle Restart (34-hr) plus its own Pre-Trip Inspection prepended when the
-cycle arrives exhausted. Every event is built by EventFactory and numbered by
-TimelineBuilder; this module constructs neither an EngineEvent nor a sequence
-number itself, and every clock movement goes through `PlanningCursor.advance`.
+A long one interleaves 30-minute breaks, fuel stops, 10-hour resets and 34-hour
+restarts, each followed by a fresh pre-trip inspection where it opened a new
+duty period.
+
+No rule logic lives here. Evaluators decide what is legal and name the remedy;
+`remedies.py` owns what a remedy is; this module only sequences them. Every
+event is built by EventFactory and numbered by TimelineBuilder, and every clock
+movement goes through `PlanningCursor.advance`.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from decimal import Decimal
+from datetime import timedelta
+from decimal import ROUND_DOWN, Decimal
 
 from apps.planning.choices import DutyStatus, EventType
 from apps.planning.services.hos.constants import (
-    CYCLE_RESTART_HOURS,
     DROPOFF_HOURS,
     PICKUP_HOURS,
     POSTTRIP_INSPECTION_HOURS,
     PRETRIP_INSPECTION_HOURS,
 )
-from apps.planning.services.hos.cursor import PlannerAction, PlanningCursor, group_into_days
+from apps.planning.services.hos.cursor import (
+    PlannerAction,
+    PlanningCursor,
+    drivable_budget,
+    group_into_days,
+)
 from apps.planning.services.hos.evaluators.base import RuleEvaluator
 from apps.planning.services.hos.event_factory import EventFactory
 from apps.planning.services.hos.models import (
@@ -70,67 +79,97 @@ from apps.planning.services.hos.models import (
     RouteLegInput,
     RuleResult,
 )
+from apps.planning.services.hos.remedies import RemedyEngine, remedy_for
+
+#: Hard ceiling on turns of the planning loop, behind the no-progress guard.
+#: Never expected to fire: a legal plan makes progress on every turn, and the
+#: no-progress guard catches the case where it cannot. This exists so that a
+#: future rule whose remedy neither helps nor repeats still terminates with a
+#: diagnosable failure instead of hanging a request thread. Sized far above any
+#: real trip — a coast-to-coast run needs on the order of thirty turns.
+MAX_PLANNING_ITERATIONS = 500
+
+#: Matches TimelineEvent.distance_miles' two decimal places, so a segment's
+#: distance survives persistence unchanged and the parts of a split leg still
+#: sum to the whole once stored.
+_MILES = Decimal('0.01')
+
+#: Precision a drivable budget is rounded to before being floored to whole
+#: minutes — see `_drivable_minutes`. Small enough to be irrelevant to any
+#: rule, large enough to absorb Decimal division residue.
+_MINUTE_EPSILON = Decimal('0.000001')
 
 
 class PlanningEngine:
     """Coordinates registered RuleEvaluators over a Trip's route legs.
 
-    No rule logic lives here — this class only sequences calls to the
-    evaluators, in priority order, stops on the first block, and schedules
-    the remedy an evaluator asked for via `RuleResult.required_action`.
-    Which 70-hour threshold counts as "exhausted" is CycleLimitEvaluator's
-    business, not this class's; the engine only recognises the
-    `RESTART_34` action that evaluator reports.
+    No rule logic lives here — this class sequences calls to the evaluators,
+    picks the constraint that binds soonest, and asks RemedyEngine to schedule
+    whatever remedy that constraint named. Which 70-hour threshold counts as
+    "exhausted" is CycleLimitEvaluator's business; how long a restart lasts is
+    `remedies.py`'s. This class knows neither.
     """
 
     def __init__(self, evaluators: list[RuleEvaluator] | None = None) -> None:
         self._evaluators = sorted(evaluators or [], key=lambda evaluator: evaluator.priority())
+        self._remedies = RemedyEngine()
 
     def plan(self, context: PlanningContext) -> PlanningResult:
-        """Plan one trip by walking actions against a cursor until done.
-
-        The cursor holds every piece of state the run needs; this method only
-        decides which action comes next and reacts to the evaluators.
-        """
+        """Plan one trip, inserting legal remedies until the delivery is reached."""
         cursor = PlanningCursor(
             trip_start_time=context.trip_start_time,
             cycle_hours_used=context.cycle_hours_used,
             leg_count=len(context.route_legs),
         )
 
+        cursor.record_activity(
+            'trip_created',
+            f'Trip planning started from {context.current_location_text} '
+            f'with {context.cycle_hours_used}h already used in the 70-hour cycle.',
+        )
+        cursor.record_activity(
+            'route_generated',
+            f'Route generated: {len(context.route_legs)} leg(s), '
+            f'{sum(leg.distance_miles for leg in context.route_legs)} miles.',
+        )
+
         self._open_first_duty_period(context, cursor)
 
         # ---- the planning loop ----------------------------------------
-        # One turn per remaining leg today, because a leg is still the finest
-        # driving increment. The loop is written against the cursor rather than
-        # an index so 12B can push remedy actions into the same run without
-        # restructuring it.
+        # One turn per driving increment, which is a whole leg when the rules
+        # allow it and the legal part of a leg when they do not. The loop is
+        # written against the cursor rather than an index precisely so a remedy
+        # can be inserted mid-leg without restructuring it.
+        iterations = 0
         while not cursor.destination_reached and not cursor.paused:
-            leg = context.route_legs[cursor.leg_index]
-
-            # DRIVING is the only action that consumes driving time, so it is
-            # the only one the rules gate.
-            blocking = self._evaluate_driving(cursor, leg)
-            if blocking is not None:
-                cursor.record_pause(
-                    leg_sequence=leg.sequence,
-                    blocking=blocking,
-                    leg_duration_minutes=leg.duration_minutes,
-                    leg_distance_miles=leg.distance_miles,
+            iterations += 1
+            if iterations > MAX_PLANNING_ITERATIONS:
+                self._give_up(
+                    context,
+                    cursor,
+                    reason=(
+                        f'Planning did not converge within {MAX_PLANNING_ITERATIONS} '
+                        f'steps; no compliant schedule was found.'
+                    ),
                 )
                 break
+            self._advance_along_route(context, cursor)
 
-            self._perform_driving(cursor, leg)
-            self._perform_arrival(context, cursor, leg)
-            cursor.complete_leg()
-
-        # A pause means no legal continuation exists for a remedy this phase
-        # can schedule, so the events accumulated so far describe an incomplete
-        # trip. Returning them would be a partial plan that stops short of the
-        # delivery, which BR-37/NFR-2.4 forbid and which would break the
-        # Timeline's "spans trip start to delivery completion exactly"
-        # invariant (FR-4.5). The RuleResults and the pause still explain why.
-        events: tuple = () if cursor.paused else tuple(cursor.timeline.build())
+        if cursor.paused:
+            # No compliant schedule exists, so the events accumulated so far
+            # describe a trip that stops short of the delivery. Returning them
+            # would be a partial plan, which BR-37/NFR-2.4 forbid and which
+            # would break FR-4.5's "spans trip start to delivery completion
+            # exactly" invariant. The pause and the RuleResults explain why.
+            events: tuple = ()
+        else:
+            events = tuple(cursor.timeline.build())
+            cursor.record_activity(
+                'destination_reached',
+                f'Destination reached at {context.dropoff_location_text}; '
+                f'{len(events)} events across '
+                f'{len(group_into_days(events))} day(s).',
+            )
 
         return PlanningResult(
             context=context,
@@ -138,81 +177,353 @@ class PlanningEngine:
             rule_results=tuple(cursor.rule_results),
             days=group_into_days(events),
             pause=cursor.pause,
+            activity=tuple(cursor.activity),
         )
 
     # ------------------------------------------------------------------
-    # Actions
+    # The loop body
+    # ------------------------------------------------------------------
+
+    def _advance_along_route(self, context: PlanningContext, cursor: PlanningCursor) -> None:
+        """Take one step: either finish the current leg, or drive part of it
+        and insert the remedy that stopped it.
+        """
+        leg = context.route_legs[cursor.leg_index]
+        remaining_minutes, remaining_miles = self._remaining_of(leg, cursor)
+
+        results = self._evaluate_driving(cursor, remaining_minutes, remaining_miles)
+        cursor.rule_results.extend(results)
+        binding = self._select_binding_constraint(results, remaining_minutes, remaining_miles)
+
+        if binding is None:
+            # The whole of what is left of this leg is legal.
+            self._emit_driving(cursor, leg, remaining_minutes, remaining_miles)
+            self._emit_arrival(context, cursor, leg, is_final=cursor.is_final_leg)
+            cursor.complete_leg()
+            return
+
+        # Drive as far as the binding constraint permits, then remedy it. A
+        # zero-length drivable stretch is normal — it means the clock ran out
+        # exactly at the current position — and emits no event (BR-35).
+        drivable_minutes = self._drivable_minutes(binding, remaining_minutes, remaining_miles)
+        if drivable_minutes > 0:
+            segment_miles = self._segment_miles(
+                remaining_miles, drivable_minutes, remaining_minutes
+            )
+            self._emit_driving(cursor, leg, drivable_minutes, segment_miles)
+            cursor.advance_into_leg(drivable_minutes, segment_miles)
+
+        self._insert_remedy(context, cursor, leg, binding)
+
+    @staticmethod
+    def _remaining_of(leg: RouteLegInput, cursor: PlanningCursor) -> tuple[int, Decimal]:
+        """What is left of the current leg from the cursor's position.
+
+        Always `total - progress`, never a running sum of the pieces: this is
+        what makes the segments of a split leg add back up to the leg exactly,
+        however many times it was split and whatever rounding each split needed.
+        """
+        return (
+            leg.duration_minutes - cursor.minutes_into_leg,
+            leg.distance_miles - cursor.distance_into_leg_miles,
+        )
+
+    # ------------------------------------------------------------------
+    # Rules
+    # ------------------------------------------------------------------
+
+    def _evaluate_driving(
+        self, cursor: PlanningCursor, minutes: int, miles: Decimal
+    ) -> list[RuleResult]:
+        """Ask every rule about the proposed driving increment.
+
+        **Every** rule, not just up to the first block: picking the constraint
+        that binds soonest means comparing all of them, and a rule that is never
+        run cannot be compared. Evaluators are pure, so running them all costs
+        only the call.
+
+        Note which clocks are handed to which rule. BR-19 is measured from the
+        last fuel stop, so it gets `distance_since_fuel_miles`, not the trip
+        total; BR-4 is measured from the last qualifying break, so it gets
+        `driving_since_break_hours`, not BR-1's per-duty-period total. Passing
+        the trip totals to either would make the engine schedule stops that are
+        not due, or — worse — fail to schedule ones that are.
+        """
+        eval_context = EvaluationContext(
+            cumulative_driving_hours=cursor.clocks.driving_hours,
+            elapsed_duty_window_hours=cursor.clocks.duty_window_hours,
+            proposed_driving_hours=Decimal(minutes) / MINUTES_PER_HOUR,
+            cumulative_distance_miles=cursor.clocks.distance_since_fuel_miles,
+            proposed_distance_miles=miles,
+            cumulative_cycle_hours=cursor.clocks.cycle_hours,
+            driving_hours_since_break=cursor.clocks.driving_since_break_hours,
+        )
+        return [evaluator.evaluate(eval_context) for evaluator in self._evaluators]
+
+    @staticmethod
+    def _select_binding_constraint(
+        results: list[RuleResult], minutes: int, miles: Decimal
+    ) -> RuleResult | None:
+        """Of the rules that blocked, the one that will actually bind first.
+
+        Priority order is the wrong answer once remedies are inserted, and
+        wrong in a way that produces a legal-looking plan for the wrong reason.
+        Consider a driver with 2 hours left in the 70-hour cycle and 1 hour left
+        in the 14-hour window: both rules block a 3-hour leg, but the cycle has
+        the higher priority, so first-block-wins would schedule a 34-hour
+        restart where a 10-hour reset was due — and would do it an hour later
+        than the window actually allows.
+
+        So: convert each blocking rule's remaining budget into hours of driving
+        and take the smallest. Priority survives only as the tie-breaker, since
+        `min` keeps the first of equal keys and `results` arrives in priority
+        order. A rule that reports no usable budget sorts ahead of everything —
+        it permits nothing, which is the earliest possible bind.
+        """
+        blocking = [result for result in results if not result.allowed]
+        if not blocking:
+            return None
+
+        def binds_after(result: RuleResult) -> Decimal:
+            hours, _ = drivable_budget(result, minutes, miles)
+            return hours if hours is not None else Decimal('-1')
+
+        return min(blocking, key=binds_after)
+
+    @staticmethod
+    def _drivable_minutes(binding: RuleResult, minutes: int, miles: Decimal) -> int:
+        """Whole minutes of driving the binding constraint still permits.
+
+        Rounded **down**, always: a partial minute of driving beyond the limit
+        is a violation, and rounding up to reach a tidier split point would
+        produce exactly the non-compliant plan BR-37 forbids.
+
+        Clamped into `[0, minutes]` defensively. A blocking result reports a
+        budget strictly smaller than the increment it rejected, so the clamp
+        should never bite — but "should never" is not a guarantee to hand an
+        arithmetic that decides whether a driver may keep driving.
+
+        The quantise before the floor is not cosmetic. A budget derived by
+        division carries Decimal's 28-significant-digit residue: a fuel budget
+        of 1,000 of 1,500 miles over two hours comes back as
+        79.99999999999999999999999998 minutes, which floors to 79 and quietly
+        strands a minute of driving at every single split. Rounding away the
+        last few digits first — 60 microseconds, far below the whole-minute
+        resolution everything else here uses — recovers the 80.
+        """
+        hours, _ = drivable_budget(binding, minutes, miles)
+        if hours is None or hours <= 0:
+            return 0
+        exact = (hours * MINUTES_PER_HOUR).quantize(_MINUTE_EPSILON)
+        return max(0, min(int(exact), minutes))
+
+    @staticmethod
+    def _segment_miles(remaining_miles: Decimal, minutes: int, remaining_minutes: int) -> Decimal:
+        """The distance covered by driving `minutes` of what is left of a leg.
+
+        Pro-rated on the leg's own average speed and rounded **down** to the
+        two decimal places the timeline stores, so the segment never claims
+        mileage the remainder then has to give back. Whatever this leaves
+        behind is picked up exactly by the next call to `_remaining_of`.
+        """
+        if remaining_minutes <= 0:
+            return Decimal('0')
+        pro_rata = remaining_miles * Decimal(minutes) / Decimal(remaining_minutes)
+        return pro_rata.quantize(_MILES, rounding=ROUND_DOWN)
+
+    # ------------------------------------------------------------------
+    # Remedies
+    # ------------------------------------------------------------------
+
+    def _insert_remedy(
+        self,
+        context: PlanningContext,
+        cursor: PlanningCursor,
+        leg: RouteLegInput,
+        binding: RuleResult,
+    ) -> None:
+        """Schedule the remedy the binding rule named, then resume.
+
+        Stops the plan in exactly two cases: the rule named no remedy this
+        engine can schedule, or the remedy it named was already applied and
+        nothing has been driven since — which means applying it again cannot
+        help, because remedies are idempotent on the clocks they clear.
+        """
+        remedy = remedy_for(binding.required_action)
+        if remedy is None:
+            self._give_up(
+                context,
+                cursor,
+                reason=binding.reason,
+                binding=binding,
+                leg=leg,
+                detail=(
+                    'no legal remedy exists for this rule'
+                    if binding.required_action is RequiredAction.NONE
+                    else f'the required action "{binding.required_action.value}" '
+                    f'is not one this engine can schedule'
+                ),
+            )
+            return
+
+        if (
+            not cursor.drove_since_last_remedy
+            and cursor.last_remedy_action == remedy.action.value
+        ):
+            self._give_up(
+                context,
+                cursor,
+                reason=binding.reason,
+                binding=binding,
+                leg=leg,
+                detail=(
+                    f'a {remedy.label} was already taken and no driving was possible '
+                    f'afterwards, so repeating it cannot make progress'
+                ),
+            )
+            return
+
+        location_name, latitude, longitude = self._position_on(leg, cursor)
+
+        outcome = self._remedies.apply(
+            cursor,
+            remedy,
+            location_name=location_name,
+            latitude=latitude,
+            longitude=longitude,
+            reason=binding.reason,
+        )
+        cursor.record_activity(
+            'remedy_inserted',
+            f'{remedy.label.capitalize()} inserted at {location_name}: {binding.reason}',
+            rule_id=binding.rule_id,
+            leg_sequence=leg.sequence,
+        )
+
+        if outcome.opened_new_duty_period:
+            self._emit_pretrip_inspection(
+                cursor,
+                location_name=location_name,
+                latitude=latitude,
+                longitude=longitude,
+                reason=(
+                    f'Pre-trip inspection opening the duty period that begins after the '
+                    f'{remedy.label} (BR-21; a qualifying off-duty block starts a new '
+                    f'duty period).'
+                ),
+            )
+
+        cursor.record_activity(
+            'planning_resumed',
+            f'Planning resumed on leg {leg.sequence} toward {leg.destination_text}.',
+            leg_sequence=leg.sequence,
+        )
+
+    def _give_up(
+        self,
+        context: PlanningContext,
+        cursor: PlanningCursor,
+        *,
+        reason: str,
+        binding: RuleResult | None = None,
+        leg: RouteLegInput | None = None,
+        detail: str | None = None,
+    ) -> None:
+        """Record the pause that ends the plan without a delivery."""
+        leg = leg if leg is not None else context.route_legs[min(cursor.leg_index, cursor.leg_count - 1)]
+        remaining_minutes, remaining_miles = self._remaining_of(leg, cursor)
+
+        blocking = binding if binding is not None else RuleResult(
+            allowed=False,
+            evaluator_name='PlanningEngine',
+            reason=reason,
+            required_action=RequiredAction.NONE,
+        )
+        cursor.record_pause(
+            leg_sequence=leg.sequence,
+            blocking=blocking,
+            leg_duration_minutes=max(remaining_minutes, 0),
+            leg_distance_miles=max(remaining_miles, Decimal('0')),
+        )
+        cursor.record_activity(
+            'planning_failed',
+            f'Planning stopped on leg {leg.sequence}: {reason}'
+            + (f' ({detail})' if detail else ''),
+            rule_id=blocking.rule_id,
+            leg_sequence=leg.sequence,
+        )
+
+    # ------------------------------------------------------------------
+    # Position
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _position_on(leg: RouteLegInput, cursor: PlanningCursor) -> tuple[str, float, float]:
+        """Where the truck is on the current leg: a name and a coordinate.
+
+        At the start of a leg this is exactly the leg's origin, which is what
+        keeps an unsplit trip's events identical to what they always were.
+
+        Part-way through, there is nothing exact to return: `RouteLegInput`
+        carries the two endpoints and no geometry, so the position is
+        interpolated along the straight line between them, proportionally to
+        the distance driven. That places a break marker near the right part of
+        the route rather than on it. Carrying the real polyline into the engine
+        would fix it, and is an input-model change (the encoded geometry exists
+        on the routing side but is not part of the engine's contract) rather
+        than an engine one.
+
+        The stop's *timing* is unaffected by any of this — the duty clocks
+        decide when to stop, and they are exact. Only the pin is approximate.
+        """
+        driven = cursor.distance_into_leg_miles
+        if driven <= 0 and cursor.minutes_into_leg <= 0:
+            return leg.origin_text, leg.origin_latitude, leg.origin_longitude
+
+        if leg.distance_miles > 0:
+            fraction = float(driven / leg.distance_miles)
+        elif leg.duration_minutes > 0:
+            fraction = cursor.minutes_into_leg / leg.duration_minutes
+        else:
+            fraction = 0.0
+        fraction = min(max(fraction, 0.0), 1.0)
+
+        latitude = leg.origin_latitude + (leg.destination_latitude - leg.origin_latitude) * fraction
+        longitude = (
+            leg.origin_longitude + (leg.destination_longitude - leg.origin_longitude) * fraction
+        )
+        # Truncated to the column width; a long resolved place name plus the
+        # prefix can otherwise exceed TimelineEvent.location_name's 255.
+        name = f'En route to {leg.destination_text} ({int(driven)} mi into leg {leg.sequence})'
+        return name[:255], latitude, longitude
+
+    # ------------------------------------------------------------------
+    # Events
     # ------------------------------------------------------------------
 
     def _open_first_duty_period(self, context: PlanningContext, cursor: PlanningCursor) -> None:
         """Start the trip: a pre-flight restart if the cycle is exhausted,
         otherwise the pre-trip inspection that opens the first duty period.
 
-        A restart emits its own inspection, so only one of the two paths runs.
+        A restart opens its own duty period and so emits its own inspection,
+        which is why only one of the two paths runs.
         """
         if self._apply_preflight_restart(context, cursor):
             return
 
         # Open the first duty period (BR-21). The 14-hour window opens at the
         # start of this inspection, not at the first driving minute (BR-24).
-        self._emit_pretrip_inspection(context, cursor)
-
-    def _evaluate_driving(
-        self, cursor: PlanningCursor, leg: RouteLegInput
-    ) -> RuleResult | None:
-        """Ask the rules whether the next driving increment is allowed.
-
-        Records every result produced onto the cursor and returns the blocking
-        one, or None. One evaluation per leg, first block wins by priority —
-        unchanged, because splitting a leg into several evaluated increments
-        would change which rule binds first.
-        """
-        eval_context = EvaluationContext(
-            cumulative_driving_hours=cursor.clocks.driving_hours,
-            elapsed_duty_window_hours=cursor.clocks.duty_window_hours,
-            proposed_driving_hours=leg.duration_hours,
-            cumulative_distance_miles=cursor.clocks.distance_miles,
-            proposed_distance_miles=leg.distance_miles,
-            cumulative_cycle_hours=cursor.clocks.cycle_hours,
+        origin = context.route_legs[0]
+        self._emit_pretrip_inspection(
+            cursor,
+            location_name=context.current_location_text,
+            latitude=origin.origin_latitude,
+            longitude=origin.origin_longitude,
+            reason=(
+                'Pre-trip inspection opening the duty period; the 14-hour duty '
+                'window starts here (BR-21, BR-24).'
+            ),
         )
-        results, blocking = self._run_evaluators(eval_context)
-        cursor.rule_results.extend(results)
-        return blocking
-
-    def _perform_driving(self, cursor: PlanningCursor, leg: RouteLegInput) -> None:
-        """Emit the leg's Driving event and advance the cursor by it."""
-        self._emit_driving(leg, cursor)
-
-    def _perform_arrival(
-        self, context: PlanningContext, cursor: PlanningCursor, leg: RouteLegInput
-    ) -> None:
-        """Emit the on-duty work waiting at the end of the current leg.
-
-        The final leg ends at the delivery; every earlier one ends at a pickup
-        (BR-17/BR-18). Expressed by cursor position rather than by hardcoding
-        "leg 2" so the loop stays correct for the single-leg contexts the test
-        suite also exercises.
-        """
-        self._emit_arrival(context, cursor, leg, is_final=cursor.is_final_leg)
-
-    def _run_evaluators(
-        self, eval_context: EvaluationContext
-    ) -> tuple[list[RuleResult], RuleResult | None]:
-        """Run the registered evaluators in priority order, stopping at the
-        first block.
-
-        Returns every result produced plus the blocking one (or None). The
-        first-block-wins semantics are unchanged from the previous phase —
-        this is only extracted so the pre-flight check and the leg loop
-        share one implementation of it rather than two.
-        """
-        results: list[RuleResult] = []
-        for evaluator in self._evaluators:
-            result = evaluator.evaluate(eval_context)
-            results.append(result)
-            if not result.allowed:
-                return results, result
-        return results, None
 
     @staticmethod
     def _duration(hours: Decimal) -> timedelta:
@@ -224,15 +535,22 @@ class PlanningEngine:
         """
         return timedelta(minutes=int(hours * MINUTES_PER_HOUR))
 
-    def _emit_pretrip_inspection(self, context: PlanningContext, cursor: PlanningCursor) -> None:
+    def _emit_pretrip_inspection(
+        self,
+        cursor: PlanningCursor,
+        *,
+        location_name: str,
+        latitude: float,
+        longitude: float,
+        reason: str,
+    ) -> None:
         """Open a duty period with a 15-minute pre-trip inspection (BR-21).
 
-        Placed at the trip's start location. Because this is the timeline's
-        first event, its start time *is* the trip start time, and the
-        14-hour duty window opens here rather than at the first driving
-        minute (BR-24).
+        The one place a duty period is opened, called from all three: trip
+        start, after the pre-flight restart, and after any remedy that ends a
+        duty period mid-trip. The 14-hour window opens at the *start* of this
+        inspection, not at the first driving minute (BR-24).
         """
-        origin = context.route_legs[0]
         start = cursor.current_time
         end = start + self._duration(PRETRIP_INSPECTION_HOURS)
         cursor.timeline.add_event(
@@ -241,59 +559,78 @@ class PlanningEngine:
                 end_time=end,
                 duty_status=DutyStatus.ON_DUTY_NOT_DRIVING,
                 event_type=EventType.PRETRIP_INSPECTION,
-                location_name=context.current_location_text,
-                latitude=origin.origin_latitude,
-                longitude=origin.origin_longitude,
-                reason=(
-                    'Pre-trip inspection opening the duty period; the 14-hour duty '
-                    'window starts here (BR-21, BR-24).'
-                ),
+                location_name=location_name,
+                latitude=latitude,
+                longitude=longitude,
+                reason=reason,
             )
         )
         cursor.advance(PlannerAction.PRETRIP, PRETRIP_INSPECTION_HOURS)
 
-    def _emit_driving(self, leg: RouteLegInput, cursor: PlanningCursor) -> None:
-        """Emit one Driving event covering a whole leg.
+    def _emit_driving(
+        self,
+        cursor: PlanningCursor,
+        leg: RouteLegInput,
+        minutes: int,
+        distance_miles: Decimal,
+    ) -> None:
+        """Emit one Driving event for a stretch of a leg.
 
-        One event per leg, not per rule-boundary: splitting a leg at an
-        arbitrary mileage needs route geometry `RouteLegInput` does not
-        carry, so a leg is still the smallest driving increment the engine
-        can express. Located at the leg's origin, because that is where the
-        duty-status change happens and therefore where BR-29's log remark
-        belongs.
+        A stretch is the whole leg when the rules allowed it and the legal part
+        of one when they did not. Located at wherever the truck currently is,
+        because that is where the duty-status change happens and therefore
+        where BR-29's log remark belongs.
 
-        A zero-duration leg (EC-1, a same-location hop) contributes no
+        A zero-duration stretch (EC-1, a same-location hop) contributes no
         event at all rather than a zero-length one, per BR-35.
         """
-        if leg.duration_minutes == 0:
-            # EC-1: a same-location hop passes no time and moves no clock.
+        if minutes <= 0:
             return
 
+        is_whole_leg = cursor.minutes_into_leg == 0 and minutes == leg.duration_minutes
+        location_name, latitude, longitude = self._position_on(leg, cursor)
+
+        if is_whole_leg:
+            reason = (
+                f'Driving leg {leg.sequence} from {leg.origin_text} to '
+                f'{leg.destination_text} (BR-13).'
+            )
+        else:
+            reason = (
+                f'Driving leg {leg.sequence} toward {leg.destination_text}: '
+                f'{distance_miles} miles of the leg, split to stay within the '
+                f'hours-of-service limits (BR-13).'
+            )
+
         start = cursor.current_time
-        end = start + timedelta(minutes=leg.duration_minutes)
         cursor.timeline.add_event(
             EventFactory.create_event(
                 start_time=start,
-                end_time=end,
+                end_time=start + timedelta(minutes=minutes),
                 duty_status=DutyStatus.DRIVING,
                 event_type=EventType.DRIVE,
-                location_name=leg.origin_text,
-                latitude=leg.origin_latitude,
-                longitude=leg.origin_longitude,
-                reason=(
-                    f'Driving leg {leg.sequence} from {leg.origin_text} to '
-                    f'{leg.destination_text} (BR-13).'
-                ),
-                distance_miles=leg.distance_miles,
+                location_name=location_name,
+                latitude=latitude,
+                longitude=longitude,
+                reason=reason,
+                distance_miles=distance_miles,
             )
         )
-        # Driving accrues against the driving clock, the duty window and the
-        # cycle at once — advance() is what keeps them from diverging.
+        # Driving accrues against the driving clock, the break trigger, the
+        # duty window and the cycle at once — advance() is what keeps them
+        # from diverging.
         cursor.advance_minutes(
             PlannerAction.DRIVING,
-            leg.duration_minutes,
-            distance_miles=leg.distance_miles,
+            minutes,
+            distance_miles=distance_miles,
             counts_as_driving=True,
+        )
+        cursor.drove_since_last_remedy = True
+        cursor.record_activity(
+            'driving_completed',
+            f'Drove {distance_miles} miles on leg {leg.sequence}'
+            + ('' if is_whole_leg else ' (partial segment)') + '.',
+            leg_sequence=leg.sequence,
         )
 
     def _emit_arrival(
@@ -305,14 +642,11 @@ class PlanningEngine:
     ) -> None:
         """Emit the on-duty work waiting at the end of a leg.
 
-        Returns the advanced clock and the on-duty hours consumed, which the
-        caller accrues against the duty window and the cycle. All events
-        here are On Duty (Not Driving) per BR-14.
-
         The final leg ends at the delivery: one hour of unloading (BR-18)
         followed by the post-trip inspection that closes the duty period
         (BR-22), which is the trip's last event. Every earlier leg ends at
-        the pickup: one hour of loading (BR-17).
+        the pickup: one hour of loading (BR-17). All events here are On Duty
+        (Not Driving) per BR-14.
 
         Note on ordering: `hos-engine-design.md` §4 step 6.8 lists the
         post-trip inspection *before* the dropoff, while §6.3's worked
@@ -391,20 +725,25 @@ class PlanningEngine:
         CycleLimitEvaluator can block a zero-hour increment (every other
         evaluator allows one, since it consumes no budget), and any block
         that is not a RESTART_34 request is deliberately ignored so this
-        guard can never halt a plan the leg loop would otherwise have
+        guard can never halt a plan the main loop would otherwise have
         handled.
 
-        **Assumption (approved, and the one this phase makes most
-        visible): a 34-hour restart begins a new duty period, and
-        therefore emits its own pre-trip inspection.** `hos-engine-design.md`
-        records duty-period granularity as the design's most consequential
-        open question — BR-21/BR-22 bracket "each duty period" without the
-        PRD defining where one ends. This engine resolves it as: any
-        qualifying off-duty block of 10 hours or more (so every 10-hour
-        reset and every 34-hour restart) closes one duty period and opens
-        the next, which gets a fresh 15-minute pre-trip inspection. The
-        14-hour window then opens at the *start* of that inspection, not
-        at the first driving minute (BR-24).
+        This runs before the loop rather than inside it because there is no
+        driving to split yet: the truck has not moved, so the restart needs no
+        position and the loop's split arithmetic has nothing to work on. The
+        restart *itself* goes through the same RemedyEngine as a mid-trip one,
+        so there is only one definition of what a 34-hour restart does.
+
+        **Assumption (approved): a 34-hour restart begins a new duty period,
+        and therefore emits its own pre-trip inspection.**
+        `hos-engine-design.md` records duty-period granularity as the design's
+        most consequential open question — BR-21/BR-22 bracket "each duty
+        period" without the PRD defining where one ends. This engine resolves
+        it as: any qualifying off-duty block of 10 hours or more (so every
+        10-hour reset and every 34-hour restart) closes one duty period and
+        opens the next, which gets a fresh 15-minute pre-trip inspection. The
+        14-hour window then opens at the *start* of that inspection, not at the
+        first driving minute (BR-24).
         """
         probe = EvaluationContext(
             cumulative_driving_hours=Decimal('0'),
@@ -412,9 +751,16 @@ class PlanningEngine:
             proposed_driving_hours=Decimal('0'),
             cumulative_cycle_hours=cursor.clocks.cycle_hours,
         )
-        _, blocking_result = self._run_evaluators(probe)
+        # First-block-wins is the right semantics here, unlike in the loop:
+        # this is a yes/no guard on a zero-length increment, not a choice
+        # between constraints that bind at different times.
+        blocking_result = self._first_block(probe)
 
         if blocking_result is None or blocking_result.required_action is not RequiredAction.RESTART_34:
+            return False
+
+        remedy = remedy_for(RequiredAction.RESTART_34)
+        if remedy is None:  # pragma: no cover - the table always has this entry
             return False
 
         # Only the blocking result is recorded: the probe's allowed results are
@@ -422,60 +768,47 @@ class PlanningEngine:
         cursor.rule_results.append(blocking_result)
 
         # Both events sit at the trip's start location. PlanningContext
-        # guarantees at least one leg, and no interpolation is needed
-        # because the truck has not moved yet — which is precisely what
-        # makes the pre-flight restart placeable without route geometry.
+        # guarantees at least one leg, and no interpolation is needed because
+        # the truck has not moved yet.
         origin = context.route_legs[0]
-        latitude = origin.origin_latitude
-        longitude = origin.origin_longitude
         location_name = context.current_location_text
 
-        # Converted to whole minutes so the clock arithmetic stays exact —
-        # both durations are exact multiples of a minute by construction.
-        current_time = cursor.current_time
-        restart_end = current_time + timedelta(minutes=int(CYCLE_RESTART_HOURS * MINUTES_PER_HOUR))
-        cursor.timeline.add_event(
-            EventFactory.create_event(
-                start_time=current_time,
-                end_time=restart_end,
-                # Off Duty per A-10's simpler default; sleeper berth is a
-                # structurally valid alternative the v1 policy never picks.
-                duty_status=DutyStatus.OFF_DUTY,
-                event_type=EventType.CYCLE_RESTART_34,
-                location_name=location_name,
-                latitude=latitude,
-                longitude=longitude,
-                reason=blocking_result.reason,
-            )
+        self._remedies.apply(
+            cursor,
+            remedy,
+            location_name=location_name,
+            latitude=origin.origin_latitude,
+            longitude=origin.origin_longitude,
+            reason=blocking_result.reason,
         )
-        # 34 hours off duty: time passes, but no duty or cycle hours accrue,
-        # and the restart clears the cycle entirely (BR-10).
-        cursor.advance(
-            PlannerAction.CYCLE_RESTART, CYCLE_RESTART_HOURS, counts_as_on_duty=False
+        cursor.record_activity(
+            'remedy_inserted',
+            f'{remedy.label.capitalize()} inserted before departure: {blocking_result.reason}',
+            rule_id=blocking_result.rule_id,
         )
-        cursor.reset_cycle()
-        cursor.open_new_duty_period()
 
-        inspection_end = restart_end + timedelta(
-            minutes=int(PRETRIP_INSPECTION_HOURS * MINUTES_PER_HOUR)
+        self._emit_pretrip_inspection(
+            cursor,
+            location_name=location_name,
+            latitude=origin.origin_latitude,
+            longitude=origin.origin_longitude,
+            reason=(
+                f'Pre-trip inspection opening the duty period that begins after the '
+                f'{remedy.label} (BR-21; a qualifying off-duty block starts a new '
+                f'duty period).'
+            ),
         )
-        cursor.timeline.add_event(
-            EventFactory.create_event(
-                start_time=restart_end,
-                end_time=inspection_end,
-                duty_status=DutyStatus.ON_DUTY_NOT_DRIVING,
-                event_type=EventType.PRETRIP_INSPECTION,
-                location_name=location_name,
-                latitude=latitude,
-                longitude=longitude,
-                reason=(
-                    'Pre-trip inspection opening the duty period that begins after the '
-                    '34-hour cycle restart (BR-21; restart starts a new duty period).'
-                ),
-            )
-        )
-        # The inspection that follows is on-duty time, so it immediately
-        # accrues against the fresh cycle total (BR-8) and against the duty
-        # window it just opened (BR-24).
-        cursor.advance(PlannerAction.PRETRIP, PRETRIP_INSPECTION_HOURS)
+        cursor.record_activity('planning_resumed', 'Planning resumed after the cycle restart.')
         return True
+
+    def _first_block(self, eval_context: EvaluationContext) -> RuleResult | None:
+        """The first evaluator to block, in priority order, or None.
+
+        Used only by the pre-flight guard. The main loop compares every rule
+        instead — see `_select_binding_constraint`.
+        """
+        for evaluator in self._evaluators:
+            result = evaluator.evaluate(eval_context)
+            if not result.allowed:
+                return result
+        return None

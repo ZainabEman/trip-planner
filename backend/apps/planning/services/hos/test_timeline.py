@@ -235,10 +235,10 @@ class TimelineEdgeCaseTests(SimpleTestCase):
         self.assertEqual(event_types.count(EventType.DRIVE), 1)  # leg 2 only
         self.assertIn(EventType.PICKUP, event_types)
 
-    def test_a_blocked_leg_produces_no_events_at_all(self):
-        # A 20-hour leg breaches the 14-hour duty window. No remedy for that
-        # is scheduled yet, so rather than a timeline that stops short of the
-        # delivery the engine emits nothing (BR-37, FR-4.5).
+    def test_a_blocked_leg_is_scheduled_across_days_rather_than_abandoned(self):
+        # A 20-hour leg breaches the 11-hour driving limit, the 14-hour window
+        # and the break trigger. Rather than emitting nothing, the engine
+        # splits it around the remedies each rule asks for and still delivers.
         long_leg = RouteLegInput(
             sequence=1,
             origin_text='Dallas, TX',
@@ -252,9 +252,22 @@ class TimelineEdgeCaseTests(SimpleTestCase):
         )
 
         result = plan(long_leg)
+        event_types = [event.event_type for event in result.events]
 
-        self.assertEqual(result.events, ())
         self.assertTrue(any(not rule.allowed for rule in result.rule_results))
+        self.assertIn(EventType.REST_BREAK_30, event_types)
+        self.assertIn(EventType.DAILY_REST_10, event_types)
+        self.assertEqual(event_types[-1], EventType.POSTTRIP_INSPECTION)
+        self.assertGreater(len(result.days), 1)
+        # Splitting must neither lose nor invent mileage.
+        self.assertEqual(
+            sum(
+                event.distance_miles
+                for event in result.events
+                if event.event_type == EventType.DRIVE
+            ),
+            Decimal('900.00'),
+        )
 
     def test_exhausted_cycle_prepends_a_restart_to_a_complete_timeline(self):
         result = plan(cycle_hours_used=Decimal('70'))

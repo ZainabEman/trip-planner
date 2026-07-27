@@ -31,17 +31,23 @@ from decimal import Decimal
 from apps.planning.services.hos.models import MINUTES_PER_HOUR, EngineEvent, RuleResult
 from apps.planning.services.hos.timeline_builder import TimelineBuilder
 
+#: Precision an hours-to-minutes conversion is rounded to before being floored.
+#: Decimal carries 28 significant digits, so `Decimal(62)/60*60` is
+#: 61.99999999999999999999999998 — flooring that loses a whole minute. Rounding
+#: at six decimal places of a minute (60 microseconds) removes the residue
+#: without loosening anything a rule cares about.
+_MINUTE_EPSILON = Decimal('0.000001')
+
 
 class PlannerAction(enum.Enum):
     """What the planner is doing at a point in the schedule.
 
     Named states rather than booleans: the engine previously distinguished
     "is this the last leg" with an `is_final` flag, which does not extend to
-    the breaks and resets Phase 12B adds. An enum does.
+    the breaks and resets that are now scheduled mid-trip. An enum does.
 
-    `BREAK`, `FUEL` and `OFF_DUTY` are declared but not yet scheduled — they are
-    the actions 12B will push onto the queue when a remedy is required. Naming
-    them now fixes the vocabulary the remedy work will use.
+    Every member is now reachable. `BREAK`, `FUEL`, `OFF_DUTY` and
+    `CYCLE_RESTART` are what RemedyEngine appends when a rule blocks.
     """
 
     PRETRIP = 'pretrip'
@@ -71,6 +77,18 @@ class DutyClocks:
     distance_miles: Decimal = Decimal('0')
     elapsed_hours: Decimal = Decimal('0')
 
+    # Two clocks that only diverge from the ones above once remedies are
+    # scheduled, which is why they arrived with them:
+    #
+    # * `driving_since_break_hours` is BR-4's trigger. A 30-minute break clears
+    #   it while leaving `driving_hours` (BR-1's 11-hour budget) untouched — the
+    #   whole point of a break being cheaper than a reset.
+    # * `distance_since_fuel_miles` is BR-19's interval. A fuel stop clears it
+    #   while `distance_miles` keeps accumulating as the trip total, which is
+    #   what the summary reports.
+    driving_since_break_hours: Decimal = Decimal('0')
+    distance_since_fuel_miles: Decimal = Decimal('0')
+
     def snapshot(self) -> 'DutyClocks':
         """A detached copy, for recording state at a point in time."""
         return DutyClocks(
@@ -79,21 +97,41 @@ class DutyClocks:
             cycle_hours=self.cycle_hours,
             distance_miles=self.distance_miles,
             elapsed_hours=self.elapsed_hours,
+            driving_since_break_hours=self.driving_since_break_hours,
+            distance_since_fuel_miles=self.distance_since_fuel_miles,
         )
 
 
 @dataclass(frozen=True)
-class PlanningPause:
-    """Where planning stopped, and what it would take to continue.
+class PlanningActivity:
+    """One entry in the narrative of a planning run.
 
-    This is the record Phase 12B consumes. Today the engine still returns no
-    events when it pauses — the behaviour is unchanged — but it now knows
-    *where* on the leg it ran out of clock and how much of the leg remains,
-    which is exactly what inserting a remedy and resuming needs.
+    The audit trail in `rule_results` says which rules were consulted; this says
+    what the planner *did* — drove a segment, inserted a break, resumed, arrived.
+    Derived state for reporting: never persisted, never serialised, and nothing
+    in the engine reads it back.
+    """
+
+    sequence: int
+    at: datetime
+    kind: str
+    message: str
+    rule_id: str | None = None
+    leg_sequence: int | None = None
+
+
+@dataclass(frozen=True)
+class PlanningPause:
+    """Why planning could not continue, and where it gave up.
+
+    A pause is now a genuine dead end, not an ordinary block: the engine
+    inserts a remedy and resumes for any rule that names one, so reaching here
+    means either the binding rule named no remedy the engine can schedule, or
+    scheduling it moved nothing (see PlanningEngine's no-progress guard).
 
     `drivable_hours`/`drivable_miles` are how far the truck could legally have
-    gone before the binding limit; `remaining_*` is what would be left of the
-    leg afterwards. Both are derived from the blocking `RuleResult`'s own
+    gone before the binding limit; `remaining_*` is what was left of the leg
+    afterwards. Both are derived from the blocking `RuleResult`'s own
     remaining-budget field, so the engine still holds no threshold of its own.
     """
 
@@ -140,19 +178,33 @@ class PlanningCursor:
         self.trip_start_time = trip_start_time
         self.current_time = trip_start_time
 
-        # Position: which leg, and how far into it. `distance_into_leg_miles`
-        # stays zero while legs are atomic, and becomes meaningful the moment
-        # 12B resumes a partially driven leg.
+        # Position: which leg, and how far into it. Both partial-progress
+        # figures are tracked rather than one derived from the other, because
+        # deriving miles from a minutes ratio (or the reverse) accumulates
+        # rounding across a leg that gets split several times. Each is only
+        # ever *added to*, and the amount left is always computed as
+        # `leg total - progress`, so the parts of a split leg sum to the whole
+        # by construction rather than by arithmetic that has to be checked.
         self.leg_index = 0
         self.leg_count = leg_count
         self.distance_into_leg_miles = Decimal('0')
+        self.minutes_into_leg = 0
 
         self.clocks = DutyClocks(cycle_hours=cycle_hours_used)
 
         self.timeline = TimelineBuilder()
         self.rule_results: list[RuleResult] = []
         self.completed_actions: list[PlannerAction] = []
+        self.activity: list[PlanningActivity] = []
         self.pause: PlanningPause | None = None
+
+        # Loop-safety state, read by PlanningEngine's no-progress guard: the
+        # remedy applied most recently, and whether any driving has happened
+        # since. Applying the same remedy twice with no driving in between can
+        # never help — remedies are idempotent on the clocks they clear — so
+        # that pair is exactly the signature of a plan that cannot continue.
+        self.last_remedy_action: str | None = None
+        self.drove_since_last_remedy = False
 
     # ------------------------------------------------------------------
     # Position
@@ -174,6 +226,31 @@ class PlanningCursor:
     def complete_leg(self) -> None:
         self.leg_index += 1
         self.distance_into_leg_miles = Decimal('0')
+        self.minutes_into_leg = 0
+
+    def advance_into_leg(self, minutes: int, distance_miles: Decimal) -> None:
+        """Record partial progress along the leg currently being driven."""
+        self.minutes_into_leg += minutes
+        self.distance_into_leg_miles += distance_miles
+
+    def record_activity(
+        self,
+        kind: str,
+        message: str,
+        *,
+        rule_id: str | None = None,
+        leg_sequence: int | None = None,
+    ) -> None:
+        self.activity.append(
+            PlanningActivity(
+                sequence=len(self.activity) + 1,
+                at=self.current_time,
+                kind=kind,
+                message=message,
+                rule_id=rule_id,
+                leg_sequence=leg_sequence,
+            )
+        )
 
     # ------------------------------------------------------------------
     # The clock engine — the single place time moves
@@ -188,31 +265,27 @@ class PlanningCursor:
         counts_as_driving: bool = False,
         counts_as_on_duty: bool = True,
     ) -> datetime:
-        """Move the clock forward for one completed action.
+        """Move the clock forward for one completed action, given its hours.
 
-        Returns the new current time. Durations are converted to whole minutes
-        so the arithmetic stays exact — every duration in `constants.py` is a
-        whole number of minutes by construction, and going via `timedelta`
-        seconds would let float in.
+        Returns the new current time. Delegates to `advance_minutes`, which is
+        the primitive: whole minutes are the engine's unit of time, and every
+        duration in `constants.py` is an exact number of them by construction.
 
-        `counts_as_on_duty=False` is how an off-duty block (a reset or a
-        restart) passes time without accruing duty or cycle hours.
+        The quantise guards the same Decimal residue `PlanningEngine.
+        _drivable_minutes` guards — `hours * 60` can land a hair under the
+        integer it should be — and here a lost minute would be worse than a
+        short drive: the event's duration and the clock's movement would
+        disagree, leaving a one-minute hole in a timeline that FR-4.1 requires
+        to be gap-free.
         """
-        minutes = int(hours * MINUTES_PER_HOUR)
-        self.current_time += timedelta(minutes=minutes)
-        self.clocks.elapsed_hours += hours
-
-        if counts_as_driving:
-            self.clocks.driving_hours += hours
-        if counts_as_on_duty:
-            # The 14-hour window and the 70-hour cycle both count all on-duty
-            # time, driving included (BR-2/BR-24, BR-8).
-            self.clocks.duty_window_hours += hours
-            self.clocks.cycle_hours += hours
-
-        self.clocks.distance_miles += distance_miles
-        self.completed_actions.append(action)
-        return self.current_time
+        minutes = int((hours * MINUTES_PER_HOUR).quantize(_MINUTE_EPSILON))
+        return self.advance_minutes(
+            action,
+            minutes,
+            distance_miles=distance_miles,
+            counts_as_driving=counts_as_driving,
+            counts_as_on_duty=counts_as_on_duty,
+        )
 
     def advance_minutes(
         self,
@@ -223,33 +296,84 @@ class PlanningCursor:
         counts_as_driving: bool = False,
         counts_as_on_duty: bool = True,
     ) -> datetime:
-        """`advance` for a duration already expressed in whole minutes.
+        """Move the clock forward for one completed action, in whole minutes.
 
-        Driving durations arrive from the routing provider as integer minutes,
-        so converting them to hours and back would round-trip through Decimal
-        for no reason.
+        **The single place time moves.** Both the wall clock and every duty
+        clock are derived from the same integer `minutes` here, which is what
+        makes an event's span and the hours it costs impossible to disagree —
+        they are the same number. Deriving one from Decimal hours and the other
+        from an integer was enough to open one-minute gaps in the timeline.
+
+        Driving durations also arrive from the routing provider as integer
+        minutes, so this is their natural entry point.
+
+        `counts_as_on_duty=False` is how an off-duty block passes time without
+        accruing *cycle* hours. It does not exempt the block from the 14-hour
+        window — see below.
         """
-        return self.advance(
-            action,
-            Decimal(minutes) / MINUTES_PER_HOUR,
-            distance_miles=distance_miles,
-            counts_as_driving=counts_as_driving,
-            counts_as_on_duty=counts_as_on_duty,
-        )
+        hours = Decimal(minutes) / MINUTES_PER_HOUR
+        self.current_time += timedelta(minutes=minutes)
+        self.clocks.elapsed_hours += hours
+
+        if counts_as_driving:
+            self.clocks.driving_hours += hours
+            self.clocks.driving_since_break_hours += hours
+
+        # BR-2/BR-24: the 14-hour window is *consecutive* hours from the start
+        # of the duty period, and does not pause for non-driving work — or for
+        # rest. A 30-minute break spends thirty minutes of it while giving
+        # nothing back, which is exactly why a break is not a substitute for a
+        # reset. So the window advances unconditionally here, and is cleared
+        # only by `open_new_duty_period` when a qualifying 10-hour block ends
+        # the period outright.
+        #
+        # The long off-duty blocks do run through here before that clearing —
+        # a 10-hour reset briefly pushes the window to 10+ hours — but they
+        # always call `open_new_duty_period` immediately after, so the value is
+        # never read in between.
+        self.clocks.duty_window_hours += hours
+
+        if counts_as_on_duty:
+            # BR-8 counts on-duty time only, driving included. Rest is the one
+            # thing that genuinely does not spend the cycle.
+            self.clocks.cycle_hours += hours
+
+        self.clocks.distance_miles += distance_miles
+        self.clocks.distance_since_fuel_miles += distance_miles
+        self.completed_actions.append(action)
+        return self.current_time
 
     def open_new_duty_period(self) -> None:
         """Reset the clocks a qualifying off-duty block clears.
 
-        Not called yet — the pre-flight restart resets its clocks through the
-        engine today. It exists so 12B's 10-hour reset and mid-trip restart have
-        one definition of "a new duty period starts here" rather than two.
+        The single definition of "a new duty period starts here", shared by the
+        10-hour reset, the mid-trip restart and the pre-flight restart.
+
+        The break trigger goes with them: any block long enough to open a new
+        duty period is at least ten hours of non-driving time, which more than
+        satisfies BR-4's thirty minutes.
         """
         self.clocks.driving_hours = Decimal('0')
         self.clocks.duty_window_hours = Decimal('0')
+        self.clocks.driving_since_break_hours = Decimal('0')
 
     def reset_cycle(self) -> None:
         """Clear the 70-hour cycle, as a 34-hour restart does (BR-10)."""
         self.clocks.cycle_hours = Decimal('0')
+
+    def take_break(self) -> None:
+        """Clear BR-4's 8-cumulative-hour trigger, and nothing else.
+
+        Deliberately narrow. A 30-minute break buys the driver the right to
+        keep driving; it does not give back any of BR-1's eleven hours, BR-2's
+        fourteen, or BR-8's seventy. Widening this is the single easiest way to
+        make the engine emit an illegal plan.
+        """
+        self.clocks.driving_since_break_hours = Decimal('0')
+
+    def refuel(self) -> None:
+        """Clear BR-19's distance-since-fuel interval, and nothing else."""
+        self.clocks.distance_since_fuel_miles = Decimal('0')
 
     # ------------------------------------------------------------------
     # Pausing
@@ -265,6 +389,11 @@ class PlanningCursor:
     ) -> PlanningPause:
         """Record where planning stopped and how much of the leg is left.
 
+        `leg_duration_minutes`/`leg_distance_miles` are what remains *from the
+        cursor's current position*, not the leg's totals — on a leg that was
+        already split once, the earlier segments are behind the cursor and are
+        not part of what is left to do.
+
         The drivable budget comes from whichever `remaining_*` field the
         blocking evaluator populated — each populates only its own. Converting
         an hours budget to miles uses the leg's own average speed, which is the
@@ -275,27 +404,9 @@ class PlanningCursor:
         unit that can be converted (or reported none at all), in which case the
         whole leg remains — never a guess.
         """
-        drivable_hours: Decimal | None = None
-        drivable_miles: Decimal | None = None
-
-        hours_budget = (
-            blocking.remaining_driving_hours
-            if blocking.remaining_driving_hours is not None
-            else blocking.remaining_duty_window_hours
-            if blocking.remaining_duty_window_hours is not None
-            else blocking.remaining_cycle_hours
+        drivable_hours, drivable_miles = drivable_budget(
+            blocking, leg_duration_minutes, leg_distance_miles
         )
-
-        if hours_budget is not None:
-            drivable_hours = hours_budget
-            if leg_duration_minutes > 0:
-                mph = leg_distance_miles / (Decimal(leg_duration_minutes) / MINUTES_PER_HOUR)
-                drivable_miles = drivable_hours * mph
-        elif blocking.remaining_distance_miles is not None:
-            drivable_miles = blocking.remaining_distance_miles
-            if leg_distance_miles > 0:
-                hours_for_leg = Decimal(leg_duration_minutes) / MINUTES_PER_HOUR
-                drivable_hours = drivable_miles / leg_distance_miles * hours_for_leg
 
         remaining_miles = leg_distance_miles
         remaining_minutes = leg_duration_minutes
@@ -319,6 +430,52 @@ class PlanningCursor:
             clocks=self.clocks.snapshot(),
         )
         return self.pause
+
+
+def drivable_budget(
+    blocking: RuleResult, duration_minutes: int, distance_miles: Decimal
+) -> tuple[Decimal | None, Decimal | None]:
+    """How much of an offered driving increment a blocking rule still permits.
+
+    Returns `(hours, miles)`, either of which may be None when the rule reported
+    no budget in a unit that can be converted. **A `None` is never replaced by a
+    guess** — the callers treat it as "nothing is drivable", which is the safe
+    direction: it schedules the remedy immediately rather than driving on a
+    number nobody supplied.
+
+    The budget comes from whichever `remaining_*` field the blocking evaluator
+    populated; each populates only its own, so at most one branch applies.
+    Converting between hours and miles uses the increment's own average speed,
+    which is the only speed information available anywhere in the engine —
+    `RouteLegInput` carries a distance and a duration, not a speed profile. A
+    split point derived this way is therefore approximate in *position* while
+    being exact in *duty hours*, and duty hours are what the rules are about.
+
+    The single definition of this conversion, shared by `PlanningCursor.
+    record_pause` and by PlanningEngine's leg splitting, so the mileage a pause
+    reports and the mileage a split actually drives cannot disagree.
+    """
+    if blocking.remaining_driving_hours is not None:
+        hours_budget = blocking.remaining_driving_hours
+    elif blocking.remaining_duty_window_hours is not None:
+        hours_budget = blocking.remaining_duty_window_hours
+    else:
+        hours_budget = blocking.remaining_cycle_hours
+
+    if hours_budget is not None:
+        if duration_minutes <= 0:
+            return hours_budget, None
+        mph = distance_miles / (Decimal(duration_minutes) / MINUTES_PER_HOUR)
+        return hours_budget, hours_budget * mph
+
+    if blocking.remaining_distance_miles is not None:
+        miles_budget = blocking.remaining_distance_miles
+        if distance_miles <= 0:
+            return None, miles_budget
+        hours_for_increment = Decimal(duration_minutes) / MINUTES_PER_HOUR
+        return miles_budget / distance_miles * hours_for_increment, miles_budget
+
+    return None, None
 
 
 def group_into_days(events: tuple[EngineEvent, ...]) -> tuple[PlanningDay, ...]:

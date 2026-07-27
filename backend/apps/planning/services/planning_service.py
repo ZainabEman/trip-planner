@@ -108,18 +108,11 @@ class TripPlanningService:
         result = self._engine.plan(self._build_context(trip, route))
 
         if not result.events:
-            blocking = self._blocking_result(result)
-            reason = (
-                blocking.reason if blocking is not None
-                else 'The engine produced no timeline events.'
-            )
+            rule_id, evaluator_name, reason = self._explain_failure(result)
             logger.warning('Trip %s could not be planned: %s', trip.id, reason)
             self._mark_failed(trip)
             raise TripNotPlannableError(
-                trip.id,
-                reason,
-                rule_id=blocking.rule_id if blocking is not None else None,
-                evaluator_name=blocking.evaluator_name if blocking is not None else None,
+                trip.id, reason, rule_id=rule_id, evaluator_name=evaluator_name
             )
 
         self._persist(trip, result.events)
@@ -160,22 +153,34 @@ class TripPlanningService:
         )
 
     @staticmethod
-    def _blocking_result(result):
-        """Find the RuleResult that stopped the plan, if there was one.
+    def _explain_failure(result) -> tuple[str | None, str | None, str]:
+        """Why the plan produced no timeline: `(rule_id, evaluator_name, reason)`.
 
-        The engine returns no events when a leg is blocked, and the blocking
-        RuleResult is the last one it recorded — the evaluator loop stops at
-        the first block, so scanning from the end finds it immediately.
+        `result.pause` is the authority. The engine now inserts a remedy and
+        resumes for any rule that names one, so a blocked RuleResult no longer
+        means the plan stopped — a successful multi-day plan is full of them,
+        one per break and reset. Scanning `rule_results` for the last block
+        would therefore name whichever rule happened to be evaluated last,
+        which on a failure is the lowest-priority rule that objected rather
+        than the one that actually ended the plan. The pause records the rule
+        the engine could not get past.
 
-        Returns None for the defensive case of an empty timeline with no
-        block recorded (e.g. no evaluators registered and a route whose only
-        leg has zero duration), which is an engine defect rather than a
-        legitimately unplannable trip.
+        The fallbacks below cover an empty timeline with no pause recorded
+        (e.g. no evaluators registered and a route whose only leg has zero
+        duration) — an engine defect rather than a legitimately unplannable
+        trip, but one that still needs a message rather than a KeyError.
         """
-        return next(
-            (rule_result for rule_result in reversed(result.rule_results) if not rule_result.allowed),
-            None,
+        pause = result.pause
+        if pause is not None:
+            return pause.rule_id, pause.evaluator_name, pause.reason
+
+        blocking = next(
+            (rule for rule in reversed(result.rule_results) if not rule.allowed), None
         )
+        if blocking is not None:
+            return blocking.rule_id, blocking.evaluator_name, blocking.reason
+
+        return None, None, 'The engine produced no timeline events.'
 
     @staticmethod
     @transaction.atomic

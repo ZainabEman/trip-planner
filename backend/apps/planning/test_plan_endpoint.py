@@ -16,6 +16,9 @@ from rest_framework import status
 
 from apps.planning.choices import EventType, TripStatus
 from apps.planning.models import RouteLeg, TimelineEvent, Trip
+from apps.planning.services.hos.engine import PlanningEngine
+from apps.planning.services.hos.evaluators import default_evaluators
+from apps.planning.services.hos.test_cursor import UnremediableEvaluator
 from apps.planning.services.planning_service import TripPlanningService
 from apps.planning.services.routing.base import RoutingProvider
 from apps.planning.services.routing.exceptions import (
@@ -65,13 +68,25 @@ class StubProvider(RoutingProvider):
         )
 
 
-def service_factory(provider: StubProvider):
+def service_factory(provider: StubProvider, engine: PlanningEngine | None = None):
     """Build the zero-arg factory the view's `TripPlanningService()` call needs."""
 
     def factory() -> TripPlanningService:
-        return TripPlanningService(routing_service=RoutingService(provider=provider))
+        return TripPlanningService(
+            routing_service=RoutingService(provider=provider), engine=engine
+        )
 
     return factory
+
+
+def unplannable_engine() -> PlanningEngine:
+    """An engine whose rules include one that can never be satisfied.
+
+    Since remedies were introduced, a long trip is not unplannable — it simply
+    takes more days. The HOS failure path is now reached only by a rule that
+    names no remedy, so that is what these tests inject.
+    """
+    return PlanningEngine(evaluators=[*default_evaluators(), UnremediableEvaluator()])
 
 
 class PlanEndpointTestCase(TestCase):
@@ -89,12 +104,20 @@ class PlanEndpointTestCase(TestCase):
             trip_start_time=START,
         )
 
-    def plan(self, provider: StubProvider | None = None, url: str | None = None):
+    def plan(
+        self,
+        provider: StubProvider | None = None,
+        url: str | None = None,
+        engine: PlanningEngine | None = None,
+    ):
         with patch(
             'apps.planning.views.TripPlanningService',
-            service_factory(provider or StubProvider()),
+            service_factory(provider or StubProvider(), engine),
         ):
             return self.client.post(url or self.url)
+
+    def plan_unplannable(self):
+        return self.plan(engine=unplannable_engine())
 
 
 class PlanEndpointSuccessTests(PlanEndpointTestCase):
@@ -211,39 +234,79 @@ class PlanEndpointSuccessTests(PlanEndpointTestCase):
         self.assertEqual(RouteLeg.objects.filter(trip=self.trip).count(), 2)
 
 
+class PlanEndpointMultiDayTests(PlanEndpointTestCase):
+    """A 20-hour leg used to return 422. It is now a legal two-day plan, served
+    through the unchanged response contract.
+    """
+
+    LONG = 20 * 60
+
+    def test_a_long_trip_now_plans_successfully(self):
+        response = self.plan(StubProvider(leg_2_minutes=self.LONG))
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()['planning_status'], TripStatus.PLANNED)
+
+    def test_the_response_shape_is_unchanged_for_a_multi_day_plan(self):
+        body = self.plan(StubProvider(leg_2_minutes=self.LONG)).json()
+
+        self.assertEqual(set(body), {'planning_status', 'trip', 'route', 'timeline', 'summary'})
+        self.assertEqual(
+            [event['sequence'] for event in body['timeline']],
+            list(range(1, len(body['timeline']) + 1)),
+        )
+
+    def test_the_timeline_carries_the_inserted_remedy_events(self):
+        timeline = self.plan(StubProvider(leg_2_minutes=self.LONG)).json()['timeline']
+        event_types = [event['event_type'] for event in timeline]
+
+        self.assertIn(EventType.REST_BREAK_30, event_types)
+        self.assertIn(EventType.DAILY_REST_10, event_types)
+        self.assertEqual(event_types[-1], EventType.POSTTRIP_INSPECTION)
+
+    def test_every_event_including_the_remedies_is_fully_populated(self):
+        # Remedy events are placed at an interpolated mid-leg position, so they
+        # are the ones most likely to arrive with a blank name or coordinate.
+        for event in self.plan(StubProvider(leg_2_minutes=self.LONG)).json()['timeline']:
+            with self.subTest(sequence=event['sequence']):
+                for field in (
+                    'start_time', 'end_time', 'duty_status', 'event_type',
+                    'location_name', 'latitude', 'longitude', 'reason',
+                ):
+                    self.assertTrue(event[field], f'{field} is empty')
+
+
 class PlanEndpointFailureTests(PlanEndpointTestCase):
     def test_unplannable_trip_returns_422(self):
-        # A 20-hour second leg breaches the 14-hour duty window, and no remedy
-        # for that is scheduled yet.
-        response = self.plan(StubProvider(leg_2_minutes=20 * 60))
+        response = self.plan_unplannable()
 
         self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
 
     def test_unplannable_trip_uses_the_error_envelope(self):
-        body = self.plan(StubProvider(leg_2_minutes=20 * 60)).json()
+        body = self.plan_unplannable().json()
 
         self.assertEqual(set(body), {'error'})
         self.assertEqual(set(body['error']), {'status_code', 'message', 'details'})
         self.assertEqual(body['error']['status_code'], 422)
 
     def test_unplannable_trip_reports_the_rule_id_and_reason(self):
-        body = self.plan(StubProvider(leg_2_minutes=20 * 60)).json()
+        body = self.plan_unplannable().json()
 
-        self.assertEqual(body['error']['details']['rule_id'], 'BR-2')
-        self.assertEqual(body['error']['details']['evaluator'], 'DutyWindowEvaluator')
-        self.assertIn('14-hour duty window', body['error']['details']['detail'])
-        self.assertIn('14-hour duty window', body['error']['message'])
+        self.assertEqual(body['error']['details']['rule_id'], 'BR-TEST')
+        self.assertEqual(body['error']['details']['evaluator'], 'UnremediableEvaluator')
+        self.assertIn('nothing can make it legal', body['error']['details']['detail'])
+        self.assertIn('nothing can make it legal', body['error']['message'])
         self.assertEqual(body['error']['details']['trip_id'], str(self.trip.id))
 
     def test_unplannable_trip_is_marked_failed_with_no_timeline(self):
-        self.plan(StubProvider(leg_2_minutes=20 * 60))
+        self.plan_unplannable()
 
         self.trip.refresh_from_db()
         self.assertEqual(self.trip.status, TripStatus.FAILED)
         self.assertEqual(TimelineEvent.objects.filter(trip=self.trip).count(), 0)
 
     def test_failure_response_never_contains_a_traceback(self):
-        raw = self.plan(StubProvider(leg_2_minutes=20 * 60)).content.decode()
+        raw = self.plan_unplannable().content.decode()
 
         for leak in ('Traceback', 'File "', 'apps/planning', 'apps\\planning'):
             with self.subTest(leak=leak):
